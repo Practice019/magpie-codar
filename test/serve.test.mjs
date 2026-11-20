@@ -34,10 +34,14 @@ import { fileURLToPath } from "node:url"
 import {
   CODAR_PORT,
   DEFAULT_CODAR_HOME,
+  SCAN_MAX_DIRS_PER_ROOT,
+  SCAN_MAX_ENTRIES,
   chatStream,
   codarServeExecutable,
   ensureServe,
+  forgetScannedCodar,
   openAIStream,
+  resolveServeExecutable,
   serveBase,
   sseToOpenAI,
 } from "../lib/serve.mjs"
@@ -184,30 +188,262 @@ const collect = async (iter) => {
 
 const doneSent = (text) => text.split("\n").filter((l) => l.trim() === "data: [DONE]").length
 
+// fakeTree is a filesystem a test states, so "which path is used when three of
+// them could be" is a fact rather than a property of the machine running the
+// suite. `files` are the paths that exist; `dirs` maps a directory to the names
+// in it; `config` is what config.json answers (no config at all when it is
+// absent). Every call is recorded, which is what the scan's bounds and the
+// "CODAR_BIN is never scanned over" rule are asserted on: a scan that ran shows
+// up as a readdir, and a candidate that was looked at shows up as an exists.
+const fakeTree = ({ files = [], dirs = {}, config } = {}) => {
+  const there = new Set(files)
+  const listed = new Map(Object.entries(dirs).map(([dir, names]) => [dir, names.map((name) => (typeof name === "string" ? { name, dir: true } : name))]))
+  const calls = { exists: [], readdir: [], readFile: [] }
+  const miss = (what, path) => {
+    const e = new Error(`ENOENT: no such file or directory, ${what} '${path}'`)
+    e.code = "ENOENT"
+    return e
+  }
+  return {
+    calls,
+    existsSync(path) {
+      calls.exists.push(path)
+      return there.has(path)
+    },
+    readdirSync(dir) {
+      calls.readdir.push(dir)
+      const entries = listed.get(dir)
+      if (!entries) throw miss("scandir", dir)
+      return entries.map((entry) => ({ name: entry.name, isDirectory: () => entry.dir !== false, isFile: () => entry.dir === false }))
+    },
+    readFileSync(path) {
+      calls.readFile.push(path)
+      if (typeof config !== "string") throw miss("open", path)
+      return config
+    },
+  }
+}
+
+// INSTALLED is this machine's own layout, which is the case the drive scan
+// exists for: no standard install, no config field, and the app inside
+// D:\software under a folder named after the installer it came from.
+const INSTALLED = "D:\\software\\Codar-Setup-latest\\codar-desktop\\resources\\bin\\codar.exe"
+const INSTALL_DIRS = { "D:\\": ["software", "temp"], "D:\\software": ["Codar-Setup-latest"], "D:\\temp": [] }
+
+// WIN_LOCAL is a %LOCALAPPDATA% a test can state, and WIN_STANDARD is where the
+// vendor's per-user setup puts the binary under it. The string is built with
+// join(), as the module builds it, so the two agree on a machine whose
+// separator is not a backslash as well.
+const WIN_LOCAL = "C:\\Users\\u\\AppData\\Local"
+const WIN_STANDARD = join(WIN_LOCAL, "Programs", "Codar", "resources", "bin", "codar.exe")
+
+// winMachine is the machine the ensureServe tests run against: a Windows
+// install where the vendor put it, so no test depends on whether this
+// computer's app is installed, and none can start this computer's real app.
+const winMachine = (files = [WIN_STANDARD]) => fakeTree({ files, dirs: INSTALL_DIRS })
+
 // ---- A) codarServeExecutable ----------------------------------------------
 
 test("codarServeExecutable names the desktop's server per platform, and CODAR_BIN overrides it", () => {
   // The server is a subcommand of the app's own binary, so its path is the
   // app's install path per platform. The install figures are the vendor's own
   // (Codar-Setup, 0.3.x): Windows drops the app into %LOCALAPPDATA%\Programs,
-  // macOS into /Applications, Linux into the user's .local share.
+  // macOS into /Applications, Linux into the user's .local share. The
+  // filesystem is stated rather than read: what this test is about is the path
+  // the platform names, not whether this computer has the app.
   const saved = process.env.CODAR_BIN
+  const empty = () => fakeTree({})
+  const home = "C:\\Users\\u\\.codar"
   try {
     delete process.env.CODAR_BIN
-    assert.equal(codarServeExecutable("win32", "C:\\Users\\u\\AppData\\Local"), join("C:\\Users\\u\\AppData\\Local", "Programs", "Codar", "resources", "bin", "codar.exe"))
-    assert.equal(codarServeExecutable("darwin", "/Users/u"), "/Applications/Codar.app/Contents/Resources/bin/codar")
-    assert.equal(codarServeExecutable("linux", "/home/u"), join("/home/u/.local/share", "codar", "resources", "bin", "codar"))
+    forgetScannedCodar()
+    assert.equal(codarServeExecutable("win32", WIN_LOCAL, { fs: empty(), home, roots: [] }), WIN_STANDARD)
+    assert.equal(codarServeExecutable("darwin", "/Users/u", { fs: empty(), home, roots: [] }), "/Applications/Codar.app/Contents/Resources/bin/codar")
+    assert.equal(codarServeExecutable("linux", "/home/u", { fs: empty(), home, roots: [] }), join("/home/u/.local/share", "codar", "resources", "bin", "codar"))
     // The environment variable is what a machine that installed the app
     // somewhere else says: the path it names is the path used, verbatim.
-    process.env.CODAR_BIN = "D:\\software\\Codar-Setup-latest\\codar-desktop\\resources\\bin\\codar.exe"
-    assert.equal(codarServeExecutable("win32", "C:\\Users\\u\\AppData\\Local"), process.env.CODAR_BIN, "CODAR_BIN is the executable")
+    process.env.CODAR_BIN = INSTALLED
+    assert.equal(codarServeExecutable("win32", WIN_LOCAL, { fs: empty(), home, roots: [] }), process.env.CODAR_BIN, "CODAR_BIN is the executable")
     process.env.CODAR_BIN = "   "
-    assert.notEqual(codarServeExecutable("win32", "C:\\x"), "   ", "a blank value is not a path")
+    assert.notEqual(codarServeExecutable("win32", "C:\\x", { fs: empty(), home, roots: [] }), "   ", "a blank value is not a path")
   } finally {
     if (saved === undefined) delete process.env.CODAR_BIN
     else process.env.CODAR_BIN = saved
   }
 })
+
+
+test("codarServeExecutable: CODAR_BIN is the answer the moment it is set, and no drive is walked for it", () => {
+  // The environment variable wins outright — over an install this search could
+  // find — because the person said where the app is. The scan is what must not
+  // happen: a CODAR_BIN is a statement about this machine, and walking three
+  // drives to answer with something else would hide a typo behind a server
+  // nobody asked for.
+  const saved = process.env.CODAR_BIN
+  const tree = fakeTree({ files: [INSTALLED], dirs: INSTALL_DIRS })
+  try {
+    process.env.CODAR_BIN = "D:\\elsewhere\\bin\\codar.exe"
+    forgetScannedCodar()
+    assert.equal(codarServeExecutable("win32", WIN_LOCAL, { fs: tree, home: "C:\\h\\.codar", roots: ["D:\\"] }), process.env.CODAR_BIN, "CODAR_BIN wins over an install the scan could find")
+    assert.equal(tree.calls.readdir.length, 0, "the drives were walked over a CODAR_BIN")
+    assert.equal(tree.calls.exists.length, 0, "and no path was even looked for")
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_BIN
+    else process.env.CODAR_BIN = saved
+    forgetScannedCodar()
+  }
+})
+
+test("ensureServe: a CODAR_BIN that is not there is named as missing, not scanned over", async () => {
+  // The failure a person can act on names the path they gave and says nothing is
+  // at it. Falling back to the scan would start a different install than the one
+  // they pointed at, and the sentence would send them looking for an app they
+  // already have.
+  const saved = process.env.CODAR_BIN
+  const named = "D:\\nowhere\\codar.exe"
+  const tree = fakeTree({ files: [INSTALLED], dirs: INSTALL_DIRS })
+  try {
+    process.env.CODAR_BIN = named
+    forgetScannedCodar()
+    let spawned = 0
+    const got = await ensureServe({ port: 6555, probe: () => false, spawn: () => (spawned++, {}), platform: "win32", localAppData: WIN_LOCAL, fs: tree, roots: ["D:\\"], timeoutMs: 100 })
+    assert.equal(got.ok, false)
+    assert.ok(got.reason.includes(named), `the reason does not name ${named}`)
+    assert.match(got.reason, /不存在/, "the reason does not say the path is not there")
+    assert.equal(spawned, 0, "the missing executable was spawned anyway")
+    assert.equal(tree.calls.readdir.length, 0, "the install the scan could find was used instead")
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_BIN
+    else process.env.CODAR_BIN = saved
+    forgetScannedCodar()
+  }
+})
+
+test("codarServeExecutable: a standard install, or the path the app's config.json records, is used when it is there", () => {
+  // The vendor's three layouts: the per-user install under the app's own name,
+  // the same under the folder the setup extracted (codar-desktop), and the
+  // all-users install under %PROGRAMFILES%. A machine has one of them; the test
+  // states each in turn and checks that the one that is there is the one used —
+  // and that no drive was walked to find it.
+  //
+  // The app's own config.json is the next thing a machine can say: an
+  // `install_dir` (the folder the app sits in) or an `app_path` (the executable
+  // itself) is read from it rather than making the person repeat the path in
+  // CODAR_BIN. Both fields are stated here, each with no standard install to
+  // answer first.
+  const saved = process.env.CODAR_BIN
+  const programFiles = "D:\\Program Files"
+  const standard = [
+    join(WIN_LOCAL, "Programs", "Codar", "resources", "bin", "codar.exe"),
+    join(WIN_LOCAL, "Programs", "codar-desktop", "resources", "bin", "codar.exe"),
+    join(programFiles, "Codar", "resources", "bin", "codar.exe"),
+  ]
+  const installDir = "D:\\apps\\Codar"
+  const recorded = [
+    ["install_dir", installDir, join(installDir, "codar-desktop", "resources", "bin", "codar.exe")],
+    ["app_path", "D:\\apps\\Codar\\bin\\codar.exe", "D:\\apps\\Codar\\bin\\codar.exe"],
+  ]
+  try {
+    delete process.env.CODAR_BIN
+    for (const only of standard) {
+      forgetScannedCodar()
+      const tree = fakeTree({ files: [only], dirs: INSTALL_DIRS })
+      const got = resolveServeExecutable("win32", WIN_LOCAL, { fs: tree, home: "C:\\h\\.codar", programFiles, roots: ["D:\\"] })
+      assert.equal(got.path, only, `the standard path ${only} was not the answer`)
+      assert.equal(got.source, "standard")
+      assert.equal(tree.calls.readdir.length, 0, "a standard install was answered by walking a drive")
+    }
+    for (const [field, value, expected] of recorded) {
+      forgetScannedCodar()
+      const tree = fakeTree({ files: [expected], dirs: INSTALL_DIRS, config: JSON.stringify({ [field]: value }) })
+      const got = resolveServeExecutable("win32", WIN_LOCAL, { fs: tree, home: "C:\\h\\.codar", programFiles, roots: ["D:\\"] })
+      assert.equal(got.path, expected, `config.json's ${field} was not used`)
+      assert.equal(got.source, "config")
+      assert.equal(tree.calls.readdir.length, 0, `config.json's ${field} was answered by walking a drive`)
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_BIN
+    else process.env.CODAR_BIN = saved
+  }
+})
+
+test("codarServeExecutable: a Codar* folder on a drive is found when no standard install is", () => {
+  // The machine this was written on: no install in any standard place, no
+  // install_dir in config.json, and the app in D:\software\Codar-Setup-latest.
+  // The layout the scan is for is a `Codar*` folder one name below a drive root
+  // — and it must not go further: a copy three names down is never opened, nor
+  // even looked at.
+  const saved = process.env.CODAR_BIN
+  const tooDeep = "D:\\a\\b\\Codar-too-deep\\codar-desktop\\resources\\bin\\codar.exe"
+  const dirs = { "D:\\": ["a", "software"], "D:\\a": ["b"], "D:\\a\\b": ["Codar-too-deep"], "D:\\software": ["Codar-Setup-latest"] }
+  try {
+    delete process.env.CODAR_BIN
+    forgetScannedCodar()
+    const tree = fakeTree({ files: [INSTALLED, tooDeep], dirs })
+    const got = resolveServeExecutable("win32", WIN_LOCAL, { fs: tree, home: "C:\\h\\.codar", roots: ["D:\\"] })
+    assert.equal(got.path, INSTALLED, "the drive's own install was not found")
+    assert.equal(got.source, "scan")
+    assert.equal(got.scanned, true)
+    assert.deepEqual(got.drives, ["D:\\"], "the scan walked a drive it was not given")
+    assert.ok(!tree.calls.exists.includes(tooDeep), "a folder three names below the drive root was opened")
+    assert.ok(!tree.calls.readdir.includes("D:\\a\\b"), "the scan went past its depth")
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_BIN
+    else process.env.CODAR_BIN = saved
+    forgetScannedCodar()
+  }
+})
+
+test("codarServeExecutable: the drive scan runs once and its answer is remembered", () => {
+  // A miss must not cost a disk walk per request: the scan is remembered, so a
+  // machine whose app is installed somewhere unusual pays for the walk when the
+  // process starts, not when a conversation starts.
+  const saved = process.env.CODAR_BIN
+  try {
+    delete process.env.CODAR_BIN
+    forgetScannedCodar()
+    const tree = fakeTree({ files: [INSTALLED], dirs: INSTALL_DIRS })
+    const machine = { fs: tree, home: "C:\\h\\.codar", roots: ["D:\\"] }
+    const first = resolveServeExecutable("win32", WIN_LOCAL, machine)
+    const walked = tree.calls.readdir.length
+    assert.ok(walked > 0, "the first call never walked the drive")
+    assert.equal(first.path, INSTALLED)
+    const second = resolveServeExecutable("win32", WIN_LOCAL, machine)
+    assert.equal(second.path, INSTALLED, "the remembered answer is not the one the first call gave")
+    assert.equal(second.source, "scan")
+    assert.equal(tree.calls.readdir.length, walked, "the second call walked the drive again")
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_BIN
+    else process.env.CODAR_BIN = saved
+    forgetScannedCodar()
+  }
+})
+
+test("codarServeExecutable: the drive scan is bounded — a directory of 1000 entries is not stat()ed in full", () => {
+  // The bound is what keeps a miss cheap on a machine whose root holds a
+  // thousand folders: at most SCAN_MAX_ENTRIES names of a directory are looked
+  // at, and only SCAN_MAX_DIRS_PER_ROOT directories of a drive are opened. The
+  // test states a drive of 1000 `Codar*` folders and counts what the scan did.
+  const saved = process.env.CODAR_BIN
+  const many = Array.from({ length: 1000 }, (_, i) => `Codar-${i}`)
+  try {
+    delete process.env.CODAR_BIN
+    forgetScannedCodar()
+    const tree = fakeTree({ files: [], dirs: { "D:\\": many } })
+    const got = resolveServeExecutable("win32", WIN_LOCAL, { fs: tree, home: "C:\\h\\.codar", roots: ["D:\\"] })
+    assert.equal(got.source, "standard", "nothing was there, so the search falls back to the standard path")
+    const checked = tree.calls.exists.filter((path) => /^D:\\Codar-\d+\\codar-desktop/.test(path))
+    assert.ok(checked.length > 0, "the scan skipped the drive's folders entirely")
+    assert.ok(checked.length < many.length, `stat()ed ${checked.length} of the drive's 1000 folders`)
+    assert.ok(checked.length <= SCAN_MAX_ENTRIES, `stat()ed ${checked.length} folders, past the ${SCAN_MAX_ENTRIES} bound`)
+    assert.ok(tree.calls.readdir.length <= 1 + SCAN_MAX_DIRS_PER_ROOT, `opened ${tree.calls.readdir.length} directories on one drive`)
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_BIN
+    else process.env.CODAR_BIN = saved
+    forgetScannedCodar()
+  }
+})
+
 
 test("serveBase and CODAR_PORT are the loopback address the server listens on", () => {
   assert.equal(serveBase(8080), "http://127.0.0.1:8080")
@@ -275,12 +511,12 @@ test("ensureServe: a silent port is started once, and the wait ends when it answ
     return { pid: 1234, unref() {} }
   }
   try {
-    const got = await ensureServe({ port, spawn, home: "D:\\codar-home", timeoutMs: 5000, intervalMs: 20 })
+    const got = await ensureServe({ port, spawn, home: "D:\\codar-home", timeoutMs: 5000, intervalMs: 20, platform: "win32", localAppData: WIN_LOCAL, fs: winMachine(), roots: [] })
     assert.equal(got.ok, true)
     assert.equal(got.spawned, true, "the answer says a server was started")
     assert.equal(spawned, 1, "the server was started more than once")
     assert.deepEqual(args[1], ["serve"], "the subcommand is `serve`")
-    assert.equal(args[0], codarServeExecutable(), "the app's own binary")
+    assert.equal(args[0], WIN_STANDARD, "the app's own binary")
     assert.equal(options.env.CODAR_HOME, "D:\\codar-home", "the server runs on the home the user signed in to")
     assert.equal(options.detached, true, "and outlives the request")
     assert.equal(options.stdio, "ignore", "its output is not the plugin's")
@@ -294,7 +530,7 @@ test("ensureServe: nothing answering inside the deadline answers {ok:false, reas
   // has to say why, in words a host's error line can carry.
   const started = Date.now()
   const port = await deadPort()
-  const got = await ensureServe({ port, spawn: () => ({ pid: 1, unref() {} }), timeoutMs: 120, intervalMs: 20 })
+  const got = await ensureServe({ port, spawn: () => ({ pid: 1, unref() {} }), timeoutMs: 120, intervalMs: 20, platform: "win32", localAppData: WIN_LOCAL, fs: winMachine(), roots: [] })
   assert.equal(got.ok, false)
   assert.equal(typeof got.reason, "string")
   assert.ok(got.reason.includes(String(port)), "the reason names the port it waited on")
@@ -322,7 +558,7 @@ test("ensureServe: concurrent callers start one server between them", async () =
     return { pid: 99, unref() {} }
   }
   try {
-    const all = await Promise.all([1, 2, 3, 4].map(() => ensureServe({ port, spawn, timeoutMs: 5000, intervalMs: 20 })))
+    const all = await Promise.all([1, 2, 3, 4].map(() => ensureServe({ port, spawn, timeoutMs: 5000, intervalMs: 20, platform: "win32", localAppData: WIN_LOCAL, fs: winMachine(), roots: [] })))
     assert.equal(spawned, 1, `started ${spawned} servers for four callers`)
     assert.ok(all.every((r) => r.ok), "every caller is told the server is there")
     assert.ok(all.find((r) => r.spawned), "the caller that started it says so (the rest joined it)")
