@@ -8,6 +8,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { homedir, tmpdir } from "node:os"
 import { join, sep } from "node:path"
 import { request as httpRequest } from "node:http"
+import { runInNewContext } from "node:vm"
 
 import { CodarPlugin } from "../index.mjs"
 import { testables } from "../lib/internal.mjs"
@@ -302,40 +303,90 @@ test("a deep no-code already-claimed sentence is not overridden by an outer succ
   assert.ok(u.until > until - 60_000, "the deep wait is what the card shows")
 })
 
-test("the verify page's send button retries a captcha that never loaded", async () => {
-  // The verify page has no tab switch to ask again, and the send handler
-  // returned on a missing captcha without asking for one: one failed ct4.js
-  // left the security-check step with a button that did nothing.
+// Run the generated browser script, not a regex for a particular flag. The
+// fake clock can strand either vendor callback without making the suite wait;
+// a bad retry would still show up here as a second script or an SMS POST.
+async function captchaPage() {
   const { startSignIn } = await import("../lib/signinpage.mjs")
-  const sms = await startSignIn({
-    sendCode: async () => {},
-    verifyCode: async () => ({ token: TOKEN, username: "user_1" }),
-    verify: { hint: "h", phone: "" },
+  const local = await startSignIn({ verify: { hint: "fixture", phone: "" } })
+  let html
+  try {
+    html = await (await fetch(local.url)).text()
+  } finally {
+    local.close()
+  }
+  const elements = new Map(Array.from(html.matchAll(/\bid="([^"]+)"/g), ([, id]) => [id, { textContent: "", disabled: false }]))
+  const scripts = [], timers = new Set(), posts = [], window = {}
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
+  runInNewContext(script, {
+    window,
+    document: {
+      getElementById: (id) => elements.get(id) ?? null,
+      querySelectorAll: () => [],
+      createElement: () => ({ remove() { this.removed = true } }),
+      head: { appendChild: (s) => scripts.push(s) },
+    },
+    setTimeout: (fn) => (timers.add(fn), fn),
+    clearTimeout: (fn) => timers.delete(fn),
+    fetch: async (path) => { posts.push(path); throw new Error("unexpected POST") },
   })
-  try {
-    const html = await (await fetch(sms.url)).text()
-    assert.match(html, /if \(!cap\) \{ ensureCaptcha\(\); return \}/, "a click without a widget asks for it again")
-  } finally {
-    sms.close()
+  return {
+    window, scripts, timers, posts,
+    send: elements.get("send"), status: elements.get("captcha-status"),
+    expire: () => { assert.equal(timers.size, 1); [...timers][0]() },
   }
-})
+}
+const browserTurn = () => new Promise((resolve) => setImmediate(resolve))
 
-test("a captcha that failed to load can be asked for again from the tab", async () => {
-  // The page script sets capReady before the async load and never put it
-  // back, so one failed ct4.js left the SMS tab with a disabled button and
-  // no way to retry but closing the page. The code now resets the flag and
-  // re-enables the button; this pins that the script does (the browser
-  // behaviour is read off the page's own source, not run).
-  const { startSignIn } = await import("../lib/signinpage.mjs")
-  const sms = await startSignIn({ sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }) })
-  try {
-    const html = await (await fetch(sms.url)).text()
-    assert.match(html, /catch \(e\) \{[\s\S]{0,300}?capReady = false/, "a failed captcha load puts the flag back")
-    assert.match(html, /请重试/, "and says the person can retry")
-    assert.match(html, /catch \(e\) \{[\s\S]{0,400}?el\("send"\)\.disabled = false/, "the button is not left disabled")
-  } finally {
-    sms.close()
-  }
+for (const kind of ["error", "incomplete", "timeout"]) {
+  test(`captcha script ${kind}: the verify page says why and allows a new attempt`, async () => {
+    const page = await captchaPage()
+    assert.equal(page.send.disabled, true)
+    assert.equal(page.status.textContent, "人机验证加载中…")
+    page.send.onclick()
+    assert.equal(page.scripts.length, 1, "a pending load is not duplicated")
+    const first = page.scripts[0]
+    if (kind === "error") first.onerror()
+    if (kind === "incomplete") first.onload()
+    if (kind === "timeout") page.expire()
+    await browserTurn()
+    assert.match(page.status.textContent, /人机验证加载失败.*请点击发送验证码重试/)
+    assert.equal(page.send.disabled, false)
+    assert.equal(first.removed, true)
+    assert.equal(page.timers.size, 0)
+    page.send.onclick()
+    assert.equal(page.scripts.length, 2)
+    assert.equal(page.send.disabled, true)
+    assert.deepEqual(page.posts, [])
+  })
+}
+
+test("a silent captcha initializer times out and its old callback cannot mount after retry", async () => {
+  const page = await captchaPage()
+  const callbacks = []
+  page.window.initAlicom4 = (_config, callback) => callbacks.push(callback)
+  page.scripts[0].onload()
+  await browserTurn()
+  assert.equal(callbacks.length, 1)
+  page.expire()
+  await browserTurn()
+  assert.match(page.status.textContent, /组件初始化超时.*重试/)
+  assert.equal(page.send.disabled, false)
+  page.send.onclick()
+  await browserTurn()
+  assert.equal(callbacks.length, 2)
+  assert.equal(page.scripts.length, 1, "the loaded script is reused")
+  let mounted = 0
+  const widget = { onError() {}, appendTo() { mounted++ } }
+  callbacks[0](widget)
+  assert.equal(mounted, 0)
+  callbacks[1](widget)
+  await browserTurn()
+  assert.equal(mounted, 1)
+  assert.equal(page.send.disabled, false)
+  assert.match(page.status.textContent, /人机验证已就绪/)
+  assert.equal(page.timers.size, 0)
+  assert.deepEqual(page.posts, [], "loading is not consent to send a code")
 })
 
 test("the SMS page sends a code only with a solved captcha, then trades the code for a token", async () => {
@@ -1119,7 +1170,12 @@ test("the scan status reads the vendor's words as the page's own states", () => 
   const { qrImageURL } = testables
   assert.equal(qrImageURL("https://codar-web.speedai.com/a.png"), true)
   assert.equal(qrImageURL("https://api.kuaipaper.com/a.png"), true)
-  for (const bad of ["http://codar-web.speedai.com/a.png", "https://127.0.0.1:8080/x", "https://codar-web.speedai.com:8443/a.png", "https://user:pw@codar-web.speedai.com/a.png", "javascript:alert(1)", "data:image/png;base64,AA", "file:///etc/passwd", "https://evil.example/a.png", "https://api.claw.speedai.com/a.png"]) {
+  // The vendor points at WeChat's image host, not an API host. Its ticket
+  // is deliberately just a fixture: the parser should return the URL whole.
+  const wechat = "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=fixture"
+  assert.equal(qrImageURL(wechat), true)
+  assert.deepEqual(wechatQrOf({ code: 200, data: { scene: "s1", qr_url: wechat } }), { scene: "s1", qrUrl: wechat })
+  for (const bad of ["https://mp.weixin.qq.com.example.test/cgi-bin/showqrcode", "http://codar-web.speedai.com/a.png", "https://127.0.0.1:8080/x", "https://codar-web.speedai.com:8443/a.png", "https://user:pw@codar-web.speedai.com/a.png", "javascript:alert(1)", "data:image/png;base64,AA", "file:///etc/passwd", "https://evil.example/a.png", "https://api.claw.speedai.com/a.png"]) {
     assert.equal(qrImageURL(bad), false, bad)
     assert.equal(wechatQrOf({ data: { scene: "s1", qr_url: bad } }), null, bad)
   }
@@ -1318,11 +1374,12 @@ test("the QR sign-in is one method the host can open, and closes with the page",
   // the page, or the test would answer its own POSTs.
   const realFetch = globalThis.fetch
   const calls = []
+  const image = "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=fixture"
   globalThis.fetch = async (url, init) => {
     const u = String(url)
     if (u.startsWith("http://127.0.0.1:")) return realFetch(u, init)
     calls.push({ url: u, method: String(init?.method ?? "GET").toUpperCase(), body: init?.body ? JSON.parse(init.body) : null })
-    if (u.endsWith("/v1/wechat/login/qrcode")) return new Response(JSON.stringify({ code: 200, data: { scene: "s-9", qr_url: "https://codar-web.speedai.com/q.png" } }), { status: 200 })
+    if (u.endsWith("/v1/wechat/login/qrcode")) return new Response(JSON.stringify({ code: 200, data: { scene: "s-9", qr_url: image } }), { status: 200 })
     return new Response(JSON.stringify({ code: 200, data: { status: "scanned" } }), { status: 200 })
   }
   const ctl = new AbortController()
@@ -1340,8 +1397,9 @@ test("the QR sign-in is one method the host can open, and closes with the page",
     const html = await (await realFetch(opened.url)).text()
     assert.match(html, /<title>登录科搭 Codar<\/title>/)
     assert.match(html, /手机号登录/, "the other way in is a tab on the same page")
-    const qr = await (await realFetch(`${opened.url}qr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).json()
-    assert.equal(qr.scene, "s-9")
+    const qr = await realFetch(`${opened.url}qr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+    assert.equal(qr.status, 200, "the vendor's WeChat image no longer makes /qr a 502")
+    assert.deepEqual(await qr.json(), { scene: "s-9", qr_url: image })
     const seen = await (await realFetch(`${opened.url}status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene: "s-9" }) })).json()
     assert.equal(seen.state, "scanned")
     // the vendor calls are the plugin's, on the vendor's hosts, never the page's
