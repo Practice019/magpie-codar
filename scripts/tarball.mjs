@@ -293,12 +293,23 @@ export const requiredFiles = [
   "lib/signinpage.mjs",
   "lib/native.mjs",
   "lib/client-body.mjs",
+  "lib/client-system.mjs",
+  "lib/client-system-data.mjs",
   "lib/guarded.mjs",
+  // The serve bridge and the two modules that feed it: the loader's fetch is
+  // lib/serve.mjs, the conversation it carries is lib/chat-bridge.mjs, and the
+  // model list it reads is lib/models-from-serve.mjs. All three are imported by
+  // index.mjs, so a tarball missing one fails at load; they are listed here so
+  // the gate refuses to run without them rather than the suite failing deep.
+  "lib/serve.mjs",
+  "lib/chat-bridge.mjs",
+  "lib/models-from-serve.mjs",
   "native/binary-name.mjs",
   "lib/catalog.mjs",
   "scripts/catalog.mjs",
   "scripts/tarball.mjs",
   "scripts/build-native.mjs",
+  "scripts/extract-client-system.mjs",
   "scripts/native-packages.mjs",
   "native/go.mod",
   "native/cmd/codar-proxy/main.go",
@@ -308,6 +319,9 @@ export const requiredFiles = [
   "test/native.test.mjs",
   "test/guarded.test.mjs",
   "test/client-body.test.mjs",
+  "test/client-system.test.mjs",
+  "test/serve.test.mjs",
+  "test/chat-bridge.test.mjs",
   "README.md",
   "CHANGELOG.md",
 ]

@@ -29,6 +29,9 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
+import { messagesToPrompt } from "./lib/chat-bridge.mjs"
+import { modelsFromServe } from "./lib/models-from-serve.mjs"
+import { chatStream, ensureServe, openAIAnswer, openAIStream, servePortOf } from "./lib/serve.mjs"
 import { requestOAuthStart } from "./lib/internal.mjs"
 import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, announceSignIn, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
@@ -121,21 +124,87 @@ const verifyPendingOf = (e, username) => {
   }
 }
 
-// chatTransport is the fetch the host is handed for chat. magpie runs a
-// loader's fetch in place of its own (host.js: `typeof o.fetch === "function"
-// ? o.fetch : fetch`), so answering one here sends the conversation through
-// the same Go proxy the card's requests use — the desktop's TLS and HTTP shape
-// instead of Bun's — and hands the answer back as a stream while it arrives.
-// A platform without the binary, or a module that cannot load, ends at the
-// ordinary fetch: chat must not fail because the native path is missing, and
-// native.mjs's chatFetch already falls back on its own for the cases it can
-// see. This is the second chance, not a second transport. Both agree on the
-// redirect rule: the proxy, or guarded.mjs's fetch in its place (guarded.mjs
-// says why the conversation's credential must not follow a Location).
-const chatTransport = async (url, init) => {
-  const send = await chatFetchOf()
-  return send ? send(url, init) : guardedFetch(url, init)
+// chatTransport is the fetch the host is handed for chat, and it is the
+// bridge to the desktop app's own local server (lib/serve.mjs).
+//
+// The reason is measured, not a preference: a direct call to the gateway is
+// refused for every client that is not the app — HTTP 403
+// {"code":"client_not_supported","message":"This login credential is
+// restricted to Codar."} — whatever headers or body it copies (2026-11-21, the
+// same request shape the app itself sends). The same account, asked through
+// `codar.exe serve` on 127.0.0.1:8080, answers 200 and the model replies. So the
+// conversation goes where the app's conversation goes: to loopback. The plugin's
+// own card still talks to the vendor's gateway directly (usage, check-in and
+// points are the account's pages, not the chat credential's), and that has not
+// changed.
+//
+// magpie runs a loader's fetch in place of its own (host.js:
+// `typeof o.fetch === "function" ? o.fetch : fetch`), so this one is the whole
+// road: OpenAI body in → messagesToPrompt → one message → the server's SSE →
+// OpenAI chunks out. A streaming request answers text/event-stream while the
+// model talks; a stream:false request answers one chat.completion.
+//
+// What it never does is hang. A server that is missing, a server that cannot be
+// started, and a run the server reports as failed each become an answer magpie
+// can show (an error chunk, or a failed Response with the sentence), because a
+// stream that stays open over a conversation that is already over is the worst
+// thing this bridge could hand the host.
+const chatTransportOf = (options = {}) => async (url, init = {}) => {
+  // `options` is the plugin's own settings, handed in by the loader: this
+  // function is built per plugin instance (see the loader), so the port and the
+  // binary are the instance's, not a module-level default.
+  const body = parseBody(init.body)
+  // A request the bridge cannot read is a request it must not answer with
+  // silence: the host sent something, and the answer says what was wrong.
+  if (!body || typeof body !== "object") return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
+  const message = messagesToPrompt(body.messages)
+  if (!message) return failedAnswer(400, "没有可发送的内容：这次请求没有消息")
+  const port = servePortOf(options)
+  // The server is ensured per request, not per process: the person may have
+  // closed the app since the last conversation, and a probe of a live server
+  // costs one loopback request. ensureServe answers at most `SERVE_TIMEOUT_MS`
+  // later either way, so this cannot wait forever.
+  const ready = await ensureServe({ port, bin: options.bin || undefined, home: options.home, timeoutMs: options.serveTimeoutMs })
+  if (!ready.ok) return failedAnswer(502, ready.reason)
+  const events = chatStream({ port, message })
+  try {
+    // A stream:false client asked for the whole answer at once; every other
+    // client (and a client that said nothing about stream, as OpenAI's own
+    // default is true) gets the events while the model talks.
+    if (body.stream === false) return await openAIAnswer(events, { model: modelOfBody(body) })
+    return openAIStream(events, { model: modelOfBody(body) })
+  } catch (e) {
+    // The server refused before the first event: HTTP 400 {"error":"message is
+    // required"} for a body it cannot read, a 405 for a route it does not have,
+    // or a port that went away between the probe and the request. The person
+    // gets the server's own sentence instead of a stream that never speaks.
+    return failedAnswer(e?.status === 400 ? 400 : 502, whyOf(e))
+  }
 }
+
+// modelOfBody is the model the chunks name: the one the caller asked for, so a
+// client showing "model: auto" over an answer is showing what it asked for. The
+// server's own setting may differ (the app routes on its own choice), and the
+// result event carries that — but an OpenAI chunk's model is the request's.
+const modelOfBody = (body) => (typeof body?.model === "string" && body.model.trim() ? body.model.trim() : "auto")
+
+// parseBody reads the body the host built: a JSON string (what an OpenAI client
+// sends), an object (a client that already parsed it), or a Request body it can
+// read once. Anything else is null, and the caller says so.
+const parseBody = (body) => {
+  if (!body) return null
+  if (typeof body === "object" && !(body instanceof Uint8Array) && typeof body.text !== "function") return body
+  try {
+    const text = typeof body === "string" ? body : new TextDecoder().decode(body)
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+// failedAnswer is a bridge failure as a Response the host can put on a line: the
+// status and the sentence, in the JSON error shape an OpenAI client reads.
+const failedAnswer = (status, said) => new Response(JSON.stringify({ error: { message: said, type: "codar_bridge_error" } }), { status, headers: { "Content-Type": "application/json; charset=utf-8" } })
 
 // claimedCampaigns and claimingCampaign hold the free-model claim down to one
 // write per campaign per process: the key is the account and the activity the
@@ -211,6 +280,27 @@ const normalizeModels = (raw) => {
   ))
 }
 
+// readOptions is what the bridge may be told, in one place: the plugin's own
+// options come from the host's `input.codar` (a host that passes settings), the
+// environment's CODAR_SERVE_PORT / CODAR_BIN cover a machine whose app lives
+// somewhere else, and every value is optional — the defaults are the app's own
+// (127.0.0.1:8080, the vendor's install path, ~/.codar). A value of the wrong
+// sort is dropped rather than carried: a port of "abc" would build an address no
+// fetch can parse, and the sentence that follows should be about the server, not
+// about a typo in a settings file.
+const readOptions = (input) => {
+  const source = input && typeof input === "object" ? input : {}
+  const given = source.codar && typeof source.codar === "object" ? source.codar : {}
+  const port = Number(given.port ?? process.env.CODAR_SERVE_PORT)
+  const timeout = Number(given.serveTimeoutMs)
+  return {
+    ...(Number.isInteger(port) && port > 0 && port < 65536 ? { port } : {}),
+    ...(typeof given.bin === "string" && given.bin.trim() ? { bin: given.bin } : {}),
+    ...(typeof given.home === "string" && given.home ? { home: given.home } : {}),
+    ...(Number.isFinite(timeout) && timeout > 0 ? { serveTimeoutMs: timeout } : {}),
+  }
+}
+
 export async function CodarPlugin(input) {
   // Read fresh on every call instead of capturing one at plugin build time:
   // tests swap the global one after this point. The host does not put fetch
@@ -232,7 +322,18 @@ export async function CodarPlugin(input) {
   // included (the config hook sets it, the loader's comment says why). Until
   // then it is the vendor's gateway; a provider served through config always
   // has a config hook run first.
+  // The chat itself no longer goes to that address (the vendor refuses every
+  // client that is not the app — see chatTransportOf); the loader's base is
+  // still the address magpie builds requests under, because the loader's fetch
+  // is what answers them. A request that never reaches the gateway is joined
+  // here and read by chatTransportOf, which asks the app's own server instead.
   let loaderBase = `${API}/v1`
+  // The options a bridge reads: the port the app's server listens on, where its
+  // binary is (CODAR_BIN, or the plugin's own option), the home its sign-in
+  // lives in, and how long a start may take. Read off `input` once, because the
+  // host hands the plugin its settings at build time and a host reload is a new
+  // instance.
+  const pluginOptions = readOptions(input)
 
   return {
     auth: {
@@ -582,7 +683,7 @@ export async function CodarPlugin(input) {
         }
         const token = tokenOf(got)
         if (!token) return {}
-        return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: chatTransport }
+        return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: chatTransportOf(pluginOptions) }
       },
 
       // Check-in: POST /v1/daily-sign. The server distinguishes "claimed"
@@ -1559,7 +1660,23 @@ export async function CodarPlugin(input) {
         // What the host handed in, as it handed it (see the catch below).
         const we = { given: raw }
         const token = tokenOf(options && typeof options === "object" ? options.auth : undefined)
-        if (!token || expired(token)) return given
+        // A lapsed or absent sign-in has nothing to ask the vendor for. The app's
+        // own server, if there is one on this machine, is still the account's
+        // list — but it is asked only when asked for: a host that reads the list
+        // at start-up should not wait on a probe, and a test that pins the
+        // identity of the answer (this table is the vendor's last answer, handed
+        // back as it was) must not meet a different one. `ask` is that choice,
+        // from the plugin's own options; the chat bridge always asks, because it
+        // has to anyway.
+        if (!token || expired(token)) {
+          if (!pluginOptions.askServe) return given
+          try {
+            const fromServe = await modelsFromServe({ port: servePortOf(pluginOptions), api: apiBase(provider), fetchImpl })
+            return fromServe.reached ? noMagicKeys({ ...given, ...fromServe.models }) : given
+          } catch {
+            return given
+          }
+        }
         try {
           // The app's Electron main process reads the catalog (main.cjs's
           // auth-request allowlist includes /v1/codar/models), using Node's
@@ -1616,13 +1733,31 @@ export async function CodarPlugin(input) {
           }
           return merged
         } catch {
-          // The host asks the same question its own way: the table it handed
-          // in is a JSON copy (`given !== we.given`), so a hook that gave it
-          // back after a failed fetch would not read as a fallback. Hand back
-          // the copy the host gave and it does — magpie then keeps the list
-          // it had instead of replacing the account's models with the
-          // embedded catalog over an outage. The marker says why for a host
-          // that reads it; the identity is what keeps the fallback a fallback.
+          // The vendor's own catalog route is what this hook used to need, and
+          // it is refused for a client that is not the app (the same 403 the
+          // chat met, see chatTransportOf). The app's own server answers the
+          // account's model instead (lib/models-from-serve.mjs): its embedded
+          // catalog plus whatever model the server itself names. That road is a
+          // loopback request, so it does not need the token — the server
+          // already holds the sign-in — and an account whose token just expired
+          // still lists the models it can actually use.
+          const fromServe = await modelsFromServe({ port: servePortOf(pluginOptions), api: apiBase(provider), fetchImpl })
+          if (fromServe.reached) {
+            // The user's own entries survive the refresh, as they do on the
+            // vendor's road: the hook keeps what the person added and takes
+            // the account's list for everything else.
+            const known = new Set(CATALOG.map((m) => m.id))
+            const own = Object.fromEntries(Object.entries(given).filter(([id]) => !known.has(id)))
+            return noMagicKeys({ ...own, ...fromServe.models })
+          }
+          // No server either: the host asks the same question its own way —
+          // the table it handed in is a JSON copy (`given !== we.given`), so a
+          // hook that gave it back after a failed fetch would not read as a
+          // fallback. Hand back the copy the host gave and it does — magpie
+          // then keeps the list it had instead of replacing the account's
+          // models with the embedded catalog over an outage. The marker says
+          // why for a host that reads it; the identity is what keeps the
+          // fallback a fallback.
           return markFallback(safeGiven)
         }
       },

@@ -251,7 +251,13 @@ test("sendVia writes a chat completion the client's way and everything else as i
     assert.equal(first.head.split("\r\n")[0], "POST /v1/chat/completions HTTP/1.1")
     const body = JSON.parse(first.body.toString())
     assert.deepEqual(Object.keys(body), [...CLIENT_KEY_ORDER, "temperature"])
-    assert.deepEqual(body.messages, [{ role: "user", content: "你好" }])
+    // The system prompt on the way out is the client's (lib/client-system.mjs):
+    // this body had none, so one is put in front, and the caller's own message
+    // is behind it, value for value.
+    assert.equal(body.messages.length, 2)
+    assert.equal(body.messages[0].role, "system")
+    assert.ok(body.messages[0].content.startsWith("You are an AI agent running on the Codar runtime."))
+    assert.deepEqual(body.messages[1], { role: "user", content: "你好" })
     assert.deepEqual(body.tools, tools)
     assert.equal(body.reasoning_effort, "high")
     // The body on the wire is not the one the caller handed over, and its

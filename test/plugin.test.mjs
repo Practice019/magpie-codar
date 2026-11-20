@@ -6549,16 +6549,26 @@ test("the auth hook carries a loader, and it hands the request the account's key
   assert.deepEqual(await p.auth.loader(async () => undefined), {}, "and no auth at all is the same")
 
   // The fetch the loader answers is handed to the host and used in place of
-  // its own: with the native chat transport off (the null at the top of this
-  // file), it has to reach the host's fetch — a loader fetch that failed
-  // without the proxy would take every conversation down with it.
+  // its own, and it no longer carries the conversation to the gateway: the
+  // vendor refuses every client that is not the app (lib/serve.mjs's header
+  // says which 403, and why the same credential asked through `codar serve`
+  // answers 200). With no server listening, the answer is a bridge failure with
+  // a sentence, not a silent stream and not a request to the vendor: this is the
+  // one thing the host must never see as "nothing happened".
   const answered = await withFetch({ "/v1/chat/completions": { body: { via: "fetch" } } }, async (calls) => {
-    const res = await first.fetch("https://api.claw.speedai.com/v1/chat/completions", { method: "POST", body: "{}" })
-    assert.equal(calls.length, 1, "the host's fetch did not carry it")
-    assert.equal(calls[0].url, "https://api.claw.speedai.com/v1/chat/completions")
+    const res = await first.fetch("https://api.claw.speedai.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "auto", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    // The bridge asked the port and the app's binary first — a probe and, with
+    // nothing listening, one start that never answers — so the calls that matter
+    // are the ones that would have carried the conversation: the vendor's.
+    const toVendor = calls.filter((c) => c.url.startsWith("https://api.claw.speedai.com"))
+    assert.equal(toVendor.length, 0, "a conversation was sent to the gateway, which refuses this client")
+    assert.equal(res.status, 502, "no server, no answer: the host gets a failure it can show")
     return res.json()
   })
-  assert.deepEqual(answered, { via: "fetch" })
+  assert.match(answered.error.message, /codar serve/, "and the sentence names what is missing")
 })
 
 // ---- round 25: the holes the five-way review left, each pinned by a test ----

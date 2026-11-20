@@ -41,7 +41,12 @@
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "scripts/native-packages.mjs"
+    "scripts/native-packages.mjs",
+    "lib/serve.mjs",
+    "lib/chat-bridge.mjs",
+    "lib/models-from-serve.mjs",
+    "test/serve.test.mjs",
+    "test/chat-bridge.test.mjs"
   ],
   "keywords": [
     "magpie",
