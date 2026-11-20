@@ -292,6 +292,7 @@ export const requiredFiles = [
   "lib/internal.mjs",
   "lib/signinpage.mjs",
   "lib/native.mjs",
+  "lib/client-body.mjs",
   "lib/guarded.mjs",
   "native/binary-name.mjs",
   "lib/catalog.mjs",
@@ -306,6 +307,7 @@ export const requiredFiles = [
   "test/style.test.mjs",
   "test/native.test.mjs",
   "test/guarded.test.mjs",
+  "test/client-body.test.mjs",
   "README.md",
   "CHANGELOG.md",
 ]
