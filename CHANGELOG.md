@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every API request now carries the desktop's own User-Agent.** A capture of the running desktop (v0.3.17, 2026-11-21; `register-machine/docs/codar/samples/raw-capture.jsonl`) shows one value on every API call it makes — `/v1/gettoken`, `/v1/agent/balance`, `/v1/daily-sign/status`, `/v1/user/wechat-bound` and `codar-web`'s `/api/web/auth/speedai` — and it is Go's: `Go-http-client/1.1`. The plugin had assumed the account side went through Electron's main-process fetch and sent Node's default `node` there, a UA no Codar install ever emits, and `node` was the only header-level difference left between the plugin's requests and the client's. `UA_DESKTOP` is kept as the name callers import, but it is no longer a second value. Three assertions in `test/plugin.test.mjs` encoded the old guess and were corrected.
+- **A sign-in now makes the two calls the desktop makes right after it.** `POST codar-web.speedai.com/api/web/auth/speedai` with `{login_at, username}` is how the model side is told this token is signed in — the gateway does not treat a token alone as a live session — and `POST api.kuaipaper.com/v1/user/wechat-bound` with `{username}` reads whether the account has a WeChat binding. The plugin made neither: it saved the token and went straight to usage. Both are awaited (so a host that saves and immediately reads usage is not racing an unwritten session) and neither can turn a completed sign-in into a failure. The switch that a request-counting test turns them off with lives in `switches` (lib/internal.mjs), not on the imported function, so setting it cannot be shadowed.
+
+
 ## [0.3.1] - 2026-11-19
 
 ### Fixed

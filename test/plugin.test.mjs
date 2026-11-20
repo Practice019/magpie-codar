@@ -25,6 +25,11 @@ testables.nativeFetch = null
 // it. Nulled too, so a loader's fetch stays on the host's fetch here — the
 // test that calls one relies on exactly that.
 testables.chatFetch = null
+// A sign-in makes two follow-up reads the desktop also makes (auth/speedai
+// and wechat-bound). They are on in production; here they are off, because a
+// test that counts a sign-in's own requests must not also count a pair it
+// never routed (see announceSignIn in lib/internal.mjs).
+testables.switches.announceSignIn = false
 
 // ANTHROPIC_ID is a model id the embedded catalog lists today, named once so
 // that regenerating catalog.mjs (a model the vendor retires, another it adds)
@@ -2791,8 +2796,8 @@ test("every request carries the User-Agent the desktop app sends on that host", 
       await p.provider.models({}, { auth: await auth() })
       const sign = calls.find((c) => c.url.includes("/v1/daily-sign"))
       const cat = calls.find((c) => c.url.includes("/v1/codar/models"))
-      assert.equal(sign.init.headers["User-Agent"], "node", "the desktop's own fetch sends `node`")
-      assert.equal(cat.init.headers["User-Agent"], "node", "the catalog is read by that same main-process fetch (the sidecar's Go UA is chat only)")
+      assert.equal(sign.init.headers["User-Agent"], "Go-http-client/1.1", "the desktop sends its Go UA on every API call (capture 2026-11-21)")
+      assert.equal(cat.init.headers["User-Agent"], "Go-http-client/1.1", "the catalog carries the same Go UA: there is no second value")
     },
   )
   const out = { headers: {} }
@@ -3584,7 +3589,7 @@ test("each endpoint is asked with its own method, host, body and credential", as
 
   for (const s of seen) {
     assert.equal(s.type, "application/json", "every request says it is JSON")
-    assert.equal(s.ua, "node", "and goes out as the desktop's own fetch does")
+    assert.equal(s.ua, "Go-http-client/1.1", "every API call carries the desktop's Go UA")
   }
 })
 
@@ -9681,6 +9686,7 @@ test("a vendor request the desktop's transport answers does not reach fetch", as
     assert.equal(seen[0].init.headers["Content-Type"], "application/json")
   } finally {
     testables.nativeFetch = null
+  // A sign-in makes two follow-up reads the desktop also makes (auth/speedai
   }
 })
 

@@ -29,15 +29,27 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, announceSignIn, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
 // (host.js's save), with expires from the token's own exp. A token that
 // states no exp keeps 0, which the host reads as "no renewal due". Without
 // this the sign-in is kept as a bare api key and nothing renews it.
-const signInResult = (token) => {
+//
+// It also does what the desktop does the moment a sign-in lands (see
+// WEB_AUTH_PATH in lib/internal.mjs): tell the model side this token is now
+// signed in, and read whether the account has a WeChat binding. Both are
+// fire-and-forget — a sign-in is not turned into a failure because a follow-up
+// read was refused — but they are awaited, because a host that saves the token
+// and immediately asks for usage should not be racing a session that the
+// gateway has not been told about yet.
+const signInResult = async (token, opts = {}) => {
   signIns += 1
+  // The two follow-up calls the desktop makes are announceSignIn's
+  // (lib/internal.mjs): it owns the switch a request-counting test turns off,
+  // so this function stays about the sign-in itself.
+  await announceSignIn(opts.username ?? usernameOf(token), token, { signal: opts.signal })
   return { type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 }
 }
 
@@ -288,7 +300,7 @@ export async function CodarPlugin(input) {
             if (!typed) {
               const got = appToken()
               if (got.error) return { type: "failed", error: got.error }
-              return signInResult(got.token)
+              return await signInResult(got.token)
             }
             // A pasted token is read the way the app's own file is: visible
             // ASCII only, an account name inside, and not past its exp. One
@@ -297,7 +309,7 @@ export async function CodarPlugin(input) {
             if (!tokenOf({ type: "api", key: typed })) return { type: "failed", error: "令牌内容无法识别（含空格、换行或非 ASCII 字符），请重新粘贴" }
             if (!usernameOf(typed)) return { type: "failed", error: "令牌里没有账号名，请粘贴科搭OAuth登录后的完整令牌" }
             if (expired(typed)) return { type: "failed", error: "登录已过期，请重新登录" }
-            return signInResult(typed)
+            return await signInResult(typed, { username: usernameOf(typed) })
           },
         },
         {
@@ -446,7 +458,7 @@ export async function CodarPlugin(input) {
                   // listener's whole TTL
                   if (got?.error) return { type: "failed", error: got.error }
                   if (!got) return { type: "failed", error: "登录已取消" }
-                  return signInResult(got.token)
+                  return await signInResult(got.token)
                 } finally {
                   signal?.removeEventListener?.("abort", onAbort)
                   page.close()
@@ -492,7 +504,7 @@ export async function CodarPlugin(input) {
             const startedAt = signIns
             try {
               const got = await login(username, password)
-              return signInResult(got.token)
+              return await signInResult(got.token, { username })
             } catch (e) {
               // The card shows this line: neither the account nor the password
               // goes into it, whatever the vendor quoted back.
@@ -543,7 +555,7 @@ export async function CodarPlugin(input) {
           if (typeof e?.message === "string") e.message = scrub(e.message, token) || "续期失败"
           throw e
         }
-        return signInResult(next)
+        return await signInResult(next)
       },
 
       // refreshLead is how long before exp the host renews: 12 hours. A
