@@ -29,6 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
+import { requestOAuthStart } from "./lib/internal.mjs"
 import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, announceSignIn, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
@@ -353,10 +354,8 @@ export async function CodarPlugin(input) {
             })
             const signIn = smsSide(
               (phone, captcha, signal) =>
-                request(`${ACCOUNT}/v1/verification-code`, {
-                  method: "POST",
+                requestOAuthStart(`${ACCOUNT}/v1/verification-code`, {
                   body: { phone, name: "user", type: "login", ...captcha },
-                  businessCodes: true,
                   signal,
                 }),
               (phone, code, signal) => login(phone, code, { signal }),
@@ -365,10 +364,8 @@ export async function CodarPlugin(input) {
               ? {
                   ...smsSide(
                     (phone, captcha, signal) =>
-                      request(`${ACCOUNT}/v1/verification-code`, {
-                        method: "POST",
+                      requestOAuthStart(`${ACCOUNT}/v1/verification-code`, {
                         body: { phone, name: pending.username, type: "ip_verify", ...captcha },
-                        businessCodes: true,
                         signal,
                       }),
                     (phone, code, signal) => verifyIp({ username: pending.username, phone, code, tempToken: pending.tempToken }, { signal }),
@@ -392,7 +389,7 @@ export async function CodarPlugin(input) {
                   // the vendor's own helper posts (web index-*.js: ft's default
                   // method is POST), and its route answers a GET with "Method
                   // Not Allowed"
-                  qrcode: async (signal) => wechatQrOf(await request(`${ACCOUNT}${WECHAT_QR_PATH}`, { method: "POST", signal })),
+                  qrcode: async (signal) => wechatQrOf(await requestOAuthStart(`${ACCOUNT}${WECHAT_QR_PATH}`, { signal })),
                   // the vendor's status endpoint is a long poll: it holds the
                   // request until the code's state changes, and measured 15
                   // seconds before answering "pending". The plugin's usual

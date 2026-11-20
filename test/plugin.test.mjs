@@ -1417,6 +1417,85 @@ test("the QR sign-in is one method the host can open, and closes with the page",
   await assert.rejects(realFetch(opened.url), "the listener is closed with the sign-in")
 })
 
+test("the OAuth page distinguishes SMS upstream failures from its own input checks", async () => {
+  const p = await CodarPlugin()
+  const method = p.auth.methods.find((m) => m.label === "科搭OAuth登录")
+  const ctl = new AbortController()
+  const realFetch = globalThis.fetch
+  const page = await method.authorize({}, { signal: ctl.signal })
+  const post = (body) => realFetch(`${page.url}send`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  })
+  const send = { phone: "13800138000", captcha: { lot_number: "lot", captcha_output: "out", pass_token: "fixture", gen_time: "123" } }
+  const route = "POST /v1/verification-code"
+  const unavailable = "科搭短信服务暂不可用，无法确认验证码是否已发送"
+  try {
+    await withFetch({}, async (calls) => {
+      const local = await post({ phone: send.phone })
+      assert.equal(local.status, 400)
+      assert.deepEqual(await local.json(), { error: "人机验证没有完成" })
+      assert.equal(calls.length, 0)
+    })
+    // An upstream HTTP failure used to read as local HTTP 400; a refusal
+    // inside HTTP 200 could even be reported as a sent code. Neither path
+    // may echo a vendor body or make a second send to resolve uncertainty.
+    for (const [stub, status, error] of [
+      [new Response("upstream HTML", { status: 502 }), 502, unavailable],
+      [() => { throw new Error("upstream connection failed") }, 502, unavailable],
+      [new Response("true"), 502, unavailable],
+      [{ status: 400, body: { message: "vendor echoed captcha fixture" } }, 422, "科搭拒绝发送验证码，请检查手机号和人机验证后再试"],
+      [{ body: { code: 200, data: { success: false, message: "vendor echoed captcha fixture" } } }, 422, "科搭拒绝发送验证码，请检查手机号和人机验证后再试"],
+      [{ body: { code: 429, message: "vendor echoed captcha fixture" } }, 429, "科搭登录服务限流，请稍后再试"],
+    ]) {
+      await withFetch({ [route]: stub }, async (calls) => {
+        const res = await post(send)
+        assert.equal(res.status, status)
+        assert.deepEqual(await res.json(), { error })
+        assert.equal(calls.length, 1, "only one vendor call for this click")
+      })
+    }
+    await withFetch({ [route]: { body: { code: 200 } } }, async (calls) => {
+      const res = await post(send)
+      assert.equal(res.status, 200)
+      assert.deepEqual(await res.json(), { ok: true })
+      assert.equal((await post(send)).status, 429)
+      assert.equal(calls.length, 1, "the local cooldown still prevents a second send")
+    })
+  } finally {
+    ctl.abort()
+  }
+})
+
+test("the OAuth page rejects a QR business refusal before reading stale image fields", async () => {
+  const p = await CodarPlugin()
+  const method = p.auth.methods.find((m) => m.label === "科搭OAuth登录")
+  const ctl = new AbortController()
+  const realFetch = globalThis.fetch
+  const page = await method.authorize({}, { signal: ctl.signal })
+  const route = "POST /v1/wechat/login/qrcode"
+  const fields = { scene: "fixture-scene", qr_url: "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=fixture" }
+  const unavailable = "科搭扫码服务暂不可用，请稍后再试"
+  try {
+    for (const [stub, status, answer] of [
+      [{ body: { code: 200, data: { success: false, ...fields } } }, 422, { error: "科搭拒绝生成二维码，请稍后再试" }],
+      [{ body: { code: 502, data: fields } }, 502, { error: unavailable }],
+      [new Response("upstream HTML", { status: 502 }), 502, { error: unavailable }],
+      [new Response("not JSON"), 502, { error: unavailable }],
+      [{ body: { code: 200, data: { ...fields, qr_url: "https://example.test/q.png" } } }, 502, { error: "二维码数据不完整" }],
+      [{ body: { code: 200, data: fields } }, 200, fields],
+    ]) {
+      await withFetch({ [route]: stub }, async (calls) => {
+        const res = await realFetch(`${page.url}qr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+        assert.equal(res.status, status)
+        assert.deepEqual(await res.json(), answer)
+        assert.equal(calls.length, 1)
+      })
+    }
+  } finally {
+    ctl.abort()
+  }
+})
+
 test("cancelling the page stops the vendor call it had in flight", async () => {
   // A QR poll is a long call (35 s) and an SMS check can be slow. Closing the
   // listener on a cancel ended the page but left those calls running to their
