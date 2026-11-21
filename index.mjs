@@ -1503,10 +1503,14 @@ export async function CodarPlugin(input) {
         // pointsError is the reason "one card item could not be read". When
         // magpie's card sees error, it draws only that line and no windows
         // (assets/kernel.js's pqLine / quotaWindows), so it is not a "partly
-        // read" marker: when part is read, draw the part that was read; only
-        // when no points at all were read does the whole card become one
-        // error line.
+        // read" marker: when part is read, draw the part that was read — and
+        // when neither balance read came back, say it in a row (below), not in
+        // a top-level error that would hide whatever the other reads drew.
         let points
+        // Set when neither balance read came back: the card then says so in
+        // one 说明 · row instead of a top-level error, which replaces the whole
+        // window area (AGENTS.md's costliest pit).
+        let balanceUnreadable
         if (pointsR.status === "fulfilled") {
           points = pointsR.value
           // General points and Agent points are two reads: use what gettoken
@@ -1533,8 +1537,9 @@ export async function CodarPlugin(input) {
           // answered an Agent number, still draw the check-in row, activities
           // and Agent points — skip the wallet row, since general points are
           // unspecified this time; inventing a 0 would make routing rank a
-          // funded account last. Only when both reads fail is the whole card
-          // one error line.
+          // funded account last. When both reads fail, the card carries one
+          // 说明 · 额度不可读 row instead of an error (an error would replace
+          // the window area — AGENTS.md's costliest pit).
           // the second balance read is the other half of the same account:
           // its restriction or expiry is the account's answer, not one row's.
           // Swallowed before, the card reported the first read's 500 while
@@ -1544,8 +1549,16 @@ export async function CodarPlugin(input) {
           if (agentR.status === "rejected" && signedOut(agentR.reason))
             return { error: "登录已过期，请重新登录", signIn: "expired" }
           const agent = agentR.status === "fulfilled" ? agentR.value : null
-          if (agent == null) return { error: scrub(whyOf(e), token) || "点数查询失败", signIn: "" }
-          points = { general: null, agent }
+          if (agent == null) {
+            // Nothing usable from either balance read: the card is not one
+            // error line (that would wipe the rows the other reads drew).
+            // The reason is carried in the 说明 · row's display, and the
+            // balance line stays empty rather than inventing a 0.
+            points = { general: null, agent: null }
+            balanceUnreadable = scrub(whyOf(e), token) || "额度读取失败"
+          } else {
+            points = { general: null, agent }
+          }
         }
 
         const windows = []
@@ -1607,16 +1620,35 @@ export async function CodarPlugin(input) {
             checkinWaitSecs(headerWaitOf(status))
           const wait = secs ? humanSecs(secs) : ""
           windows.push({
-            name: "每日签到",
+            name: "说明 · 每日签到",
             ...(secs ? { resetsAt: safeTime(Date.now() + secs * 1000) } : {}),
             display: signed ? (wait ? `今天已领，${wait}后可再领` : "今天已领") : wait ? `今天还没领，${wait}后可以领` : "今天还没领，现在可以领",
             aside: true,
           })
         }
 
-        // Points balance: what the account actually spends. It is a prepaid
-        // wallet with no "total" to take a share of, so report it as a wallet
-        // reading (balance, magpie's #3950) instead of inventing a
+        // Agent balance: the pool model calls actually spend (measured
+        // 2026-11-21: /v1/gettoken answers {token, agent_token} and
+        // /v1/agent/balance answers {data:{agent_balance}}, and the two
+        // numbers are different — 500 points beside an agent figure of 1974).
+        // This is the one that pays for the models, so it is drawn as its own
+        // 额度 · window and takes part in routing; magpie had been reading the
+        // points figure as the account's allowance and ranking it as spent.
+        // It is a wallet like the points one (no total to take a share of), so
+        // balance, never used/limit. At zero it is still drawn — a zero ranks
+        // the account last, it does not refuse it (no 停用 · row here).
+        if (points.agent != null) {
+          windows.push({
+            name: "额度 · Agent 余额",
+            balance: points.agent,
+            unit: "点",
+            display: `${points.agent} 点`,
+          })
+        }
+
+        // Points balance: the pool the web and document side spends. It is a
+        // prepaid wallet with no "total" to take a share of, so report it as a
+        // wallet reading (balance, magpie's #3950) instead of inventing a
         // percentage. magpie uses it to turn this account from "remaining
         // quota unknown" into known: the routing page says exactly how many
         // points remain instead of ranking the account after known ones. It
@@ -1630,7 +1662,7 @@ export async function CodarPlugin(input) {
         // lost, routing just stays unknown for now.
         if (points.general != null) {
           windows.push({
-            name: "点数余额",
+            name: "额度 · 点数余额",
             balance: points.general,
             unit: "点",
             display: `${points.general} 点`,
@@ -1755,13 +1787,36 @@ export async function CodarPlugin(input) {
           }
         }
 
+        // The reason neither balance could be read: it is a row that says so,
+        // never a top-level error — an error replaces the whole window area on
+        // the card, so a card that did read the check-in or the activities
+        // would lose them (AGENTS.md's costliest pit). It leads the card: the
+        // missing figure is what the person has to be told first.
+        if (balanceUnreadable != null) {
+          windows.unshift({
+            name: "说明 · 额度不可读",
+            display: balanceUnreadable,
+            aside: true,
+          })
+        }
+
+        // The top line names the pool the model calls spend first: the card's
+        // leading figure is the one routing reads, so when the agent figure is
+        // there it is the one said (one figure, not both pools on a line, which
+        // read as if the points figure were the account's allowance).
         const parts = []
-        if (points.general != null) parts.push(`${points.general} 点`)
         if (points.agent != null) parts.push(`Agent ${points.agent} 点`)
+        else if (points.general != null) parts.push(`${points.general} 点`)
         return {
           user: cleanText(username),
           balance: parts.length ? `${parts.join(" · ")} 可用` : "",
           windows,
+          // A read that answered is not a sign-in that lapsed: say so with the
+          // empty string the host and the tests both read as "kept" (a top-level
+          // error replaces the whole window area, and an unstated signIn reads
+          // as "not said" — which a caller comparing against "" cannot tell
+          // apart from an expired mark).
+          signIn: "",
         }
       },
     },

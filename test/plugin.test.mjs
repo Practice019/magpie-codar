@@ -276,7 +276,7 @@ test("a status answer's own already_claimed word still draws the row", async () 
     },
     async () => p.auth.usage(auth),
   )
-  const row = u.windows.find((w) => w.name === "每日签到")
+  const row = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.ok(row, "the check-in row is drawn")
   assert.match(row.display, /今天已领/)
   assert.ok(row.resetsAt > Date.now(), "with the wait the answer stated")
@@ -2214,19 +2214,26 @@ test("usage reports both balances and the claim window", async () => {
     async () => p.auth.usage(auth),
   )
   assert.equal(u.user, "user_1")
-  assert.match(u.balance, /500/)
-  assert.match(u.balance, /1970/)
-  const win = u.windows.find((w) => w.name === "每日签到")
+  assert.equal(u.balance, "Agent 1970 点 可用", "the top line names the pool the model calls spend")
+  const win = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.ok(win, "the claim window is there")
   assert.equal(win.used, undefined, "a check-in is not a share of an allowance: no used, so the host shows it as its text")
   assert.equal(win.aside, true, "and it is set aside, which is what makes the host read it as text")
   assert.ok(win.resetsAt > Date.now())
 })
 
-test("a balance that cannot be read fails the read, it does not become 0", async () => {
+test("a balance that cannot be read is one 说明 · row, not a 0 and not a blank card", async () => {
+  // AGENTS.md's costliest pit: a top-level error replaces the whole window
+  // area, so a card that read the check-in or the activities loses them. An
+  // unreadable balance is an aside row that says so, and no figure is made up.
   const p = await CodarPlugin()
   const u = await withFetch({ "/v1/gettoken": { status: 500, body: { detail: "boom" } } }, async () => p.auth.usage(auth))
-  assert.ok(u.error, "an unreadable balance is an error, not an empty card")
+  assert.equal(u.error, undefined, "no top-level error to wipe the card")
+  const row = u.windows.find((w) => w.name === "说明 · 额度不可读")
+  assert.ok(row, "the card says the balance could not be read")
+  assert.equal(row.aside, true, "aside: it explains, it does not route")
+  assert.match(row.display, /boom/, "with the vendor's own words")
+  assert.equal(u.balance, "", "and no balance is invented")
 })
 
 test("the claim row reads the vendor client's own spellings", async () => {
@@ -2243,7 +2250,7 @@ test("the claim row reads the vendor client's own spellings", async () => {
       },
       async () => p.auth.usage(auth),
     )
-    return u.windows.find((w) => w.name === "每日签到")
+    return u.windows.find((w) => w.name === "说明 · 每日签到")
   }
   assert.equal((await row({ signed: true })).display, "今天已领", "the client's `signed`")
   assert.equal((await row({ hasSigned: true })).display, "今天已领", "and `hasSigned`")
@@ -2279,8 +2286,8 @@ test("the balances are read by the vendor client's own names", async () => {
       async () => p.auth.usage(auth),
     )
   assert.match((await read({ remaining_points: 500 })).balance, /500 点/)
-  assert.match((await read({ points: 500 })).balance, /500 点/)
-  assert.match((await read({ balance: 500 })).balance, /500 点/)
+  assert.match((await read({ points: 500 })).balance, /^500 点 可用$/)
+  assert.match((await read({ balance: 500 })).balance, /^500 点 可用$/, "only the general figure: the top line is the points one")
   assert.match((await read({ agentToken: 7 })).balance, /Agent 7 点/)
   assert.match((await read({ agent_points: 7 })).balance, /Agent 7 点/)
   assert.match((await read({ agentPoints: 7 })).balance, /Agent 7 点/)
@@ -2289,7 +2296,8 @@ test("the balances are read by the vendor client's own names", async () => {
 test("a negative reading is not a balance", async () => {
   // The host clamps a wallet reading to 0, so passing a negative on would put
 // the vendor's words on the card beside a routing figure of 0 — two answers, neither
-  // true. Nothing usable left is an error, as with any other unreadable read.
+  // true. Nothing usable left is the 说明 · 额度不可读 row, as with any other
+  // unreadable read.
   const p = await CodarPlugin()
   const read = async (body) =>
     withFetch(
@@ -2301,12 +2309,13 @@ test("a negative reading is not a balance", async () => {
       async () => p.auth.usage(auth),
     )
   const neg = await read({ token: -5, agent_token: 3 })
-  assert.equal(neg.windows.find((w) => w.name === "点数余额"), undefined, "a negative is not a balance")
+  assert.equal(neg.windows.find((w) => w.name === "额度 · 点数余额"), undefined, "a negative is not a balance")
   assert.doesNotMatch(neg.balance, /-5/)
   assert.match(neg.balance, /Agent 3 点/)
 
   const none = await read({ token: -5, agent_token: -1 })
-  assert.match(none.error, /没有返回余额/, "nothing usable is an error, not a made-up 0")
+  assert.equal(none.error, undefined, "nothing usable is no error card")
+  assert.match(none.windows.find((w) => w.name === "说明 · 额度不可读").display, /没有返回余额/, "it is a row that says so, not a made-up 0")
 })
 
 test("a claim row's wait past the daily window carries no time", async () => {
@@ -2321,7 +2330,7 @@ test("a claim row's wait past the daily window carries no time", async () => {
     },
     async () => p.auth.usage(auth),
   )
-  const win = u.windows.find((w) => w.name === "每日签到")
+  const win = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.ok(win, "the row is still there")
   assert.equal("resetsAt" in win, false, "and carries no time it cannot use")
   assert.equal(win.display, "今天已领")
@@ -2345,11 +2354,15 @@ test("a token the vendor turns away is an error on the card, not an empty one", 
   assert.match(u.error, /登录已过期/, "a refused token is said in words, not left as a blank card")
   assert.equal(u.signIn, "expired", "and marks the sign-in for magpie")
 
+  // A refusal that is not a sign-out is still the card's answer: it is said in
+  // the 说明 · 额度不可读 row (the reason in its display), never as a top-level
+  // error, which replaces the whole window area (AGENTS.md's costliest pit).
   const busy = await withFetch(
     { "/v1/gettoken": { body: { code: 500, message: "系统繁忙" } } },
     async () => p.auth.usage(auth),
   )
-  assert.match(busy.error, /系统繁忙/, "another body code is its own error, not an empty card")
+  assert.equal(busy.error, undefined, "a body-code refusal is a row, not an error card")
+  assert.match(busy.windows.find((w) => w.name === "说明 · 额度不可读").display, /系统繁忙/, "with the vendor's own words")
   assert.equal(busy.signIn, "", "and is not mistaken for an expired sign-in")
 
   // The vendor's words are read the way its client reads them (vo): any of
@@ -2359,12 +2372,12 @@ test("a token the vendor turns away is an error on the card, not an empty one", 
     { "/v1/gettoken": { body: { code: 500, msg: "点数服务繁忙" } } },
     async () => p.auth.usage(auth),
   )
-  assert.match(spelled.error, /点数服务繁忙/, "a msg-spelled refusal keeps its words")
+  assert.match(spelled.windows.find((w) => w.name === "说明 · 额度不可读").display, /点数服务繁忙/, "a msg-spelled refusal keeps its words")
   const wrapped = await withFetch(
     { "/v1/gettoken": { body: { code: 500, data: { message: "点数服务繁忙" } } } },
     async () => p.auth.usage(auth),
   )
-  assert.match(wrapped.error, /点数服务繁忙/, "and so does one under data")
+  assert.match(wrapped.windows.find((w) => w.name === "说明 · 额度不可读").display, /点数服务繁忙/, "and so does one under data")
 })
 
 test("the claim window is on the card the moment it opens", async () => {
@@ -2380,7 +2393,7 @@ test("the claim window is on the card the moment it opens", async () => {
     },
     async () => p.auth.usage(auth),
   )
-  const win = u.windows.find((w) => w.name === "每日签到")
+  const win = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.ok(win, "the window is still on the card when the wait is over")
   assert.equal(win.used, undefined)
   assert.match(win.display, /现在可以领/)
@@ -2393,7 +2406,7 @@ test("the claim window is on the card the moment it opens", async () => {
     },
     async () => p.auth.usage(auth),
   )
-  assert.equal(bad.windows.find((w) => w.name === "每日签到"), undefined, "a status body we cannot read is no claim window")
+  assert.equal(bad.windows.find((w) => w.name === "说明 · 每日签到"), undefined, "a status body we cannot read is no claim window")
 })
 
 test("activities that are still running become windows; a failed read does not sink the card", async () => {
@@ -2451,7 +2464,8 @@ test("activities that are still running become windows; a failed read does not s
     async () => p.auth.usage(auth),
   )
   assert.equal(u2.error, undefined, "the extra reads failing must not sink the balance")
-  assert.match(u2.balance, /500/)
+  assert.equal(u2.balance, "Agent 0 点 可用", "the top line is the agent figure, even at zero")
+  assert.equal(u2.windows.find((w) => w.name === "额度 · 点数余额").balance, 500, "and the points window is still drawn")
 })
 
 test("a free activity is drawn by the vendor app's own rule, and no other", async () => {
@@ -2517,7 +2531,9 @@ test("the usage reads go out together, and a dead balance still reads the rest",
   }
   try {
     const u = await p.auth.usage(auth)
-    assert.ok(u.error, "both balance reads failing is the card's error")
+    assert.equal(u.error, undefined, "both balance reads failing is one row, not an error card")
+    assert.ok(u.windows.find((w) => w.name === "说明 · 额度不可读"), "the card says the balance could not be read")
+    assert.equal(u.balance, "", "and no figure is invented")
     assert.equal(seen.length, 4, "the two balance reads, the status and the activity list")
     assert.equal(most, 4, "all four overlapped in flight, not one after another")
   } finally {
@@ -2874,7 +2890,7 @@ test("a sub-second wait the vendor states reads as a wait on both cards", async 
     },
     async () => p.auth.usage(auth),
   )
-  const win = u.windows.find((w) => w.name === "每日签到")
+  const win = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.doesNotMatch(win.display, /0 秒/, "the row does not say the window opens in no time")
   assert.match(win.display, /1 秒后可再领/)
   assert.ok(win.resetsAt > Date.now(), "and the resetsAt is a time in the future")
@@ -3136,7 +3152,8 @@ test("each of the usage hook's four reads is given the per-request cap", async (
   try {
     const p = await CodarPlugin()
     const u = await p.auth.usage(auth)
-    assert.match(u.error, /超时/, "a read that never answers is reported as the plugin's own timeout")
+    assert.equal(u.error, undefined, "no error card")
+    assert.match(u.windows.find((w) => w.name === "说明 · 额度不可读").display, /超时/, "a read that never answers is reported as the plugin's own timeout")
     const t = testables.timing
     // three reads, then the balance fallback the first of them asked for:
     // each gets min(TIMEOUT_MS, what is left). The clock stands still here, so
@@ -3307,7 +3324,7 @@ test("the points are a wallet window, so routing has a figure for this account",
     },
     async () => p.auth.usage(auth),
   )
-  const wallet = u.windows.find((w) => w.name === "点数余额")
+  const wallet = u.windows.find((w) => w.name === "额度 · 点数余额")
   assert.ok(wallet, "the wallet window is there")
   assert.equal(wallet.balance, 2348, "the figure left, as a wallet reading")
   assert.equal(wallet.used, undefined, "no share invented for a wallet")
@@ -3857,7 +3874,8 @@ test("a balance that is not a number fails the read instead of becoming 0", asyn
       },
       async () => p.auth.usage(auth),
     )
-    assert.ok(u.error, `a body of ${JSON.stringify(bad)} is a read that failed, not a balance of 0`)
+    assert.equal(u.error, undefined, `a body of ${JSON.stringify(bad)} is no error card`)
+    assert.match(u.windows.find((w) => w.name === "说明 · 额度不可读").display, /没有返回余额/, `a body of ${JSON.stringify(bad)} is a read that failed, not a balance of 0`)
   }
   // and a numeric string still reads as the number it says
   const u = await withFetch(
@@ -3868,7 +3886,8 @@ test("a balance that is not a number fails the read instead of becoming 0", asyn
     },
     async () => p.auth.usage(auth),
   )
-  assert.match(u.balance, /2348/)
+  assert.equal(u.windows.find((w) => w.name === "额度 · 点数余额").balance, 2348, "a numeric string is the number it says")
+  assert.equal(u.balance, "Agent 0 点 可用", "the agent zero the vendor stated is the top line")
 })
 
 test("isSigned as the string \"false\" is not read as signed", async () => {
@@ -3884,7 +3903,7 @@ test("isSigned as the string \"false\" is not read as signed", async () => {
     },
     async () => p.auth.usage(auth),
   )
-  const win = u.windows.find((w) => w.name === "每日签到")
+  const win = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.match(win.display, /还没领/)
 })
 
@@ -4038,7 +4057,7 @@ test("a claim row whose time no calendar can state carries no resetsAt, not 1970
     },
     async () => p.auth.usage(auth),
   )
-  const sign = u.windows.find((w) => w.name === "每日签到")
+  const sign = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.ok(sign, "the claim row is still there")
   assert.equal("resetsAt" in sign, false, "with no time, rather than the epoch")
   assert.equal(sign.display, "今天已领", "and a text a card can show")
@@ -4267,8 +4286,9 @@ test("a points answer whose code is not 200 is a refusal, not a balance of 0", a
       },
       async () => p.auth.usage(auth),
     )
-    assert.ok(u.error, `a body of ${JSON.stringify(bad)} is a read that failed, not a balance of 0`)
-    assert.equal(u.windows, undefined, "and no card is drawn from it")
+    assert.equal(u.error, undefined, `a body of ${JSON.stringify(bad)} is no error card`)
+    assert.ok(u.windows.find((w) => w.name === "说明 · 额度不可读"), `a body of ${JSON.stringify(bad)} is a read that failed, not a balance of 0`)
+    assert.equal(u.windows.find((w) => w.name === "额度 · 点数余额"), undefined, "and no wallet is drawn from it")
   }
   // the check-in still claims; an unreadable balance is no credit, not a zero
   const r = await withFetch(
@@ -4297,10 +4317,10 @@ test("the balances are read from data when the vendor wraps them, as its client 
     },
     async () => p.auth.usage(auth),
   )
-  const wallet = u.windows.find((w) => w.name === "点数余额")
+  const wallet = u.windows.find((w) => w.name === "额度 · 点数余额")
   assert.equal(wallet.balance, 7, "the wrapped figure is the balance")
-  assert.match(u.balance, /7 点/)
-  assert.match(u.balance, /Agent 3 点/)
+  assert.equal(u.balance, "Agent 3 点 可用", "the top line is the agent figure when the account has one")
+  assert.doesNotMatch(u.balance, /7 点/, "the points figure is on its own window, not on the top line")
 })
 
 test("a claim state the vendor refused is not drawn as claimable", async () => {
@@ -4317,8 +4337,8 @@ test("a claim state the vendor refused is not drawn as claimable", async () => {
     },
     async () => p.auth.usage(auth),
   )
-  assert.equal(u.windows.find((w) => w.name === "每日签到"), undefined, "a refused answer draws no claim row")
-  assert.ok(u.windows.find((w) => w.name === "点数余额"), "the points still show")
+  assert.equal(u.windows.find((w) => w.name === "说明 · 每日签到"), undefined, "a refused answer draws no claim row")
+  assert.ok(u.windows.find((w) => w.name === "额度 · 点数余额"), "the points still show")
 })
 
 test("a wait the vendor spelled as a boolean or an array is not a wait", async () => {
@@ -4338,7 +4358,7 @@ test("a wait the vendor spelled as a boolean or an array is not a wait", async (
     },
     async () => p.auth.usage(auth),
   )
-  const sign = u.windows.find((w) => w.name === "每日签到")
+  const sign = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.equal(sign.display, "今天已领", "the claim is said, the made-up wait is not")
   assert.equal("resetsAt" in sign, false)
 
@@ -4509,7 +4529,7 @@ test("a day's sentence two data levels in is still the day's sentence", async ()
     },
     async () => p.auth.usage(auth),
   )
-  const row = u.windows.find((w) => w.name === "每日签到")
+  const row = u.windows.find((w) => w.name === "说明 · 每日签到")
   assert.ok(row, "the claim row is drawn from the wrapped status")
   assert.match(row.display, /今天已领/)
   // a refusal at the same depth is not a signed day, even beside isSigned
@@ -4521,7 +4541,7 @@ test("a day's sentence two data levels in is still the day's sentence", async ()
     },
     async () => p.auth.usage(auth),
   )
-  assert.equal(refusedStatus.windows.find((w) => w.name === "每日签到"), undefined, "a wrapped refusal draws no claim row")
+  assert.equal(refusedStatus.windows.find((w) => w.name === "说明 · 每日签到"), undefined, "a wrapped refusal draws no claim row")
 })
 
 test("an already-claimed day is not turned into a failure by the success flag", async () => {
@@ -4620,7 +4640,7 @@ test("the six promises no test used to pin", async () => {
     async () => p.auth.usage(auth),
   )
   assert.match(zero.balance, /0 点/, "a spent account reads as spent, not as unknown")
-  assert.equal(zero.windows.find((w) => w.name === "点数余额").balance, 0)
+  assert.equal(zero.windows.find((w) => w.name === "额度 · 点数余额").balance, 0)
   // 3. the week ceiling on a check-in wait: a week is sayable, a second past
   //    it is not (a rolling 24-hour day cannot produce it).
   const wait = async (secs) => {
@@ -5700,8 +5720,9 @@ test("a 200 with nothing in it is a failure with a reason, not a crash", async (
   globalThis.fetch = async (url) => (String(url).includes("/v1/gettoken") ? blank() : blank())
   try {
     const u = await p.auth.usage(auth)
-    assert.match(u.error, /不是 JSON|失败/, "a blank answer is said as what it is")
-    assert.ok(u.error, "and not as an empty card")
+    assert.equal(u.error, undefined, "a blank answer is no error card")
+    assert.match(u.windows.find((w) => w.name === "说明 · 额度不可读").display, /不是 JSON|失败/, "a blank answer is said as what it is")
+    assert.equal(u.balance, "", "and not as a balance")
   } finally {
     globalThis.fetch = real
   }
@@ -5722,8 +5743,8 @@ test("a status or activity read that never answers does not sink the card", asyn
   try {
     const u = await p.auth.usage(auth)
     assert.equal(u.error, undefined, "the points still make a card")
-    assert.match(u.balance, /77 点/, "with the balance they answered")
-    assert.equal(u.windows.filter((w) => w.name === "每日签到").length, 0, "a status read that never came back draws no row")
+    assert.match(u.balance, /Agent 5 点 可用/, "with the balance they answered")
+    assert.equal(u.windows.filter((w) => w.name === "说明 · 每日签到").length, 0, "a status read that never came back draws no row")
     assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0, "and neither does an activity read")
   } finally {
     globalThis.fetch = real
@@ -5797,7 +5818,8 @@ test("a business code a JSON number cannot hold is still a code", async () => {
   )
   assert.equal(r.outcome, "failed", "a check-in stating this code is not this attempt's claim")
   const u = await withFetch({ "/v1/gettoken": raw('{"code":1e999,"token":500,"agent_token":0}') }, async () => p.auth.usage(auth))
-  assert.ok(u.error, "and a balance read stating it is not a balance")
+  assert.equal(u.error, undefined, "no error card")
+  assert.match(u.windows.find((w) => w.name === "说明 · 额度不可读").display, /失败/, "and a balance read stating it is not a balance")
 })
 
 test("the claim row's next-claim time is that many seconds from now, in ms", async () => {
@@ -5815,7 +5837,7 @@ test("the claim row's next-claim time is that many seconds from now, in ms", asy
     },
     async () => p.auth.usage(auth),
   )
-  const win = u.windows.find((w) => w.name === "每日签到")
+  const win = u.windows.find((w) => w.name === "说明 · 每日签到")
   const gap = win.resetsAt - before
   assert.ok(Math.abs(gap - 7200 * 1000) < 2000, `a two-hour wait is 7.2e6 ms, not 7.2e3 (got ${gap})`)
 })
@@ -5854,8 +5876,8 @@ test("an agent figure the first read leaves out is read from the second", async 
     async () => p.auth.usage(auth),
   )
   assert.equal(u.error, undefined)
-  assert.equal(u.balance, "500 点 · Agent 1970 点 可用", "the agent figure the second endpoint names")
-  assert.equal(u.windows.find((w) => w.name === "点数余额").balance, 500, "and the wallet is still the first read's")
+  assert.equal(u.balance, "Agent 1970 点 可用", "the agent figure the second endpoint names")
+  assert.equal(u.windows.find((w) => w.name === "额度 · 点数余额").balance, 500, "and the wallet is still the first read's")
 })
 
 test("a dead balance read still leaves the agent figure, and does not blank the card", async () => {
@@ -5874,11 +5896,11 @@ test("a dead balance read still leaves the agent figure, and does not blank the 
   )
   assert.equal(u.error, undefined, "a card that read the agent figure is not an error card")
   assert.equal(u.balance, "Agent 4000 点 可用")
-  assert.equal(u.windows.find((w) => w.name === "点数余额"), undefined, "no wallet: the general figure was not said, and 0 is not it")
-  assert.ok(u.windows.find((w) => w.name === "每日签到"), "the check-in row is still drawn")
+  assert.equal(u.windows.find((w) => w.name === "额度 · 点数余额"), undefined, "no wallet: the general figure was not said, and 0 is not it")
+  assert.ok(u.windows.find((w) => w.name === "说明 · 每日签到"), "the check-in row is still drawn")
 })
 
-test("both balance reads failing is still the card's error, with its reason", async () => {
+test("both balance reads failing is one 说明 · row, with its reason", async () => {
   const p = await CodarPlugin()
   const u = await withFetch(
     {
@@ -5887,8 +5909,11 @@ test("both balance reads failing is still the card's error, with its reason", as
     },
     async () => p.auth.usage(auth),
   )
-  assert.match(u.error, /boom/, "the vendor's own words for the first read")
-  assert.equal(u.windows, undefined, "and nothing is drawn beside it")
+  assert.equal(u.error, undefined, "no top-level error, which would wipe the window area")
+  const row = u.windows.find((w) => w.name === "说明 · 额度不可读")
+  assert.match(row.display, /boom/, "the vendor's own words for the first read")
+  assert.equal(row.aside, true, "aside: a row that explains, never a route")
+  assert.equal(u.balance, "", "and nothing is invented beside it")
 })
 
 test("a sign-in the vendor turns away is the card's answer, whatever the other reads say", async () => {
@@ -5931,7 +5956,7 @@ test("a refusal spelled with a small code is a refusal on the activity and statu
     },
     async () => p.auth.usage(auth),
   )
-  assert.equal(u.windows.find((w) => w.name === "每日签到"), undefined, "{code:1} is not a state to draw")
+  assert.equal(u.windows.find((w) => w.name === "说明 · 每日签到"), undefined, "{code:1} is not a state to draw")
   assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0, "nor a live campaign")
 })
 
@@ -5944,7 +5969,7 @@ test("an HTTP refusal keeps the vendor's own words, not just the status", async 
     { "/v1/gettoken": { status: 429, body: { detail: "quota exceeded for this account" } }, "/v1/agent/balance": { status: 429, body: { detail: "quota exceeded for this account" } } },
     async () => p.auth.usage(auth),
   )
-  assert.match(u.error, /quota exceeded for this account/)
+  assert.match(u.windows.find((w) => w.name === "说明 · 额度不可读").display, /quota exceeded for this account/)
 })
 
 test("an HTTP 403 is a sign-in to redo, on both the card and the sign-in", async () => {
@@ -6173,7 +6198,7 @@ test("the first balance read's agent figure wins over the second one", async () 
     },
     async () => p.auth.usage(auth),
   )
-  assert.equal(u.balance, "500 点 · Agent 4000 点 可用", "the first read's figure, as the vendor's client merges them")
+  assert.equal(u.balance, "Agent 4000 点 可用", "the first read's figure, as the vendor's client merges them")
 })
 
 test("cut reads only the first 2n units of a vendor's string", () => {
@@ -6241,10 +6266,10 @@ test("a vendor code that is an object does not throw out of the hooks", () => {
       async () => p.auth.usage(auth),
     )
     assert.equal(u.error, undefined, "the card still builds")
-    assert.match(u.balance, /^500 点/, "the balance is read, not lost to the object")
-    assert.match(u.balance, /Agent 3 点/, "and so is the second endpoint's, which speaks only through an object code")
+    assert.match(u.balance, /^Agent 3 点/, "the balance is read, not lost to the object")
+    assert.match(u.balance, /可用$/, "and the second endpoint's figures are on the line")
     assert.ok(u.windows.some((w) => w.name.startsWith("免费模型")), "the activity is drawn, not dropped")
-    assert.match(u.windows.find((w) => w.name === "每日签到").display, /今天已领/, "and the sign state is read past its object code")
+    assert.match(u.windows.find((w) => w.name === "说明 · 每日签到").display, /今天已领/, "and the sign state is read past its object code")
     const r = await withFetch({ "/v1/daily-sign": { body: { code: odd } } }, async () => p.auth.checkin(auth))
     assert.equal(r.outcome, "failed", "an unreadable code is neither a throw nor a claim: nothing said the day was taken")
     assert.match(r.message, /签到失败/, "and the card names it as a failure")
@@ -6274,8 +6299,9 @@ test("a business code is read the way the vendor's client reads one", async () =
       },
       async () => p.auth.usage(auth),
     )
-    assert.ok(u.error, `${JSON.stringify(bad)} is a refusal, not a balance of 500`)
-    assert.equal(u.windows, undefined, "and no card is drawn from it")
+    assert.equal(u.error, undefined, `${JSON.stringify(bad)} is no error card`)
+    assert.ok(u.windows.find((w) => w.name === "说明 · 额度不可读"), `${JSON.stringify(bad)} is a refusal, not a balance of 500`)
+    assert.equal(u.windows.find((w) => w.name === "额度 · 点数余额"), undefined, "and no wallet is drawn from it")
   }
   assert.equal(catalogOf({ code: [], data: [{ id: "x" }] }), null, "a catalog read refuses the same way")
   assert.equal(catalogOf({ code: [400], data: [{ id: "x" }] }), null, "and so does a one-element code")
@@ -7628,8 +7654,9 @@ test("a balance read that says success:false is a refusal, not a balance of 0", 
     },
     async () => p.auth.usage(auth),
   )
-  assert.ok(u.error, "an explicit refusal is an error card, not a balance")
-  assert.equal(u.windows, undefined, "and nothing is drawn from it")
+  assert.equal(u.error, undefined, "an explicit refusal is a row, not an error card")
+  assert.ok(u.windows.find((w) => w.name === "说明 · 额度不可读"), "the card says the balance could not be read")
+  assert.equal(u.windows.find((w) => w.name === "额度 · 点数余额"), undefined, "and no wallet is drawn from it")
 })
 
 test("the agent balance is not read out of a refusal that echoes one", async () => {
@@ -7647,7 +7674,7 @@ test("the agent balance is not read out of a refusal that echoes one", async () 
     async () => p.auth.usage(auth),
   )
   assert.equal(u.error, undefined)
-  assert.ok(u.windows.some((w) => w.name === "点数余额"), "the general balance is still drawn")
+  assert.ok(u.windows.some((w) => w.name === "额度 · 点数余额"), "the general balance is still drawn")
   assert.ok(!String(u.balance ?? "").includes("Agent 5"), `the refused agent balance is not on the card: ${u.balance}`)
   assert.ok(!u.windows.some((w) => w.balance === 5), "nor in a window")
 })
@@ -7869,7 +7896,7 @@ test("a status read that says success:false draws no row, whatever it echoes", a
     },
     async () => p.auth.usage(auth),
   )
-  assert.ok(!u.windows.some((w) => w.name === "每日签到"), "a refused status is no state")
+  assert.ok(!u.windows.some((w) => w.name === "说明 · 每日签到"), "a refused status is no state")
 })
 
 test("the gate's missing npm and tar are exit 2, and a % is quoted", async () => {
@@ -7980,8 +8007,11 @@ test("an expired second read is not the account's answer when the first read wor
     async () => p.auth.usage(auth),
   )
   assert.equal(u.error, undefined, "the card is still drawn")
-  assert.equal(u.signIn, undefined, "and does not claim the sign-in expired")
-  assert.ok(u.windows.some((w) => w.name === "点数余额"), "the general balance is drawn")
+  // "" is the shape that says "kept": the usage hook now states it on every
+  // answered read, so a caller comparing against "" is not left with an
+  // `undefined` it cannot tell apart from an expired mark.
+  assert.equal(u.signIn, "", "and does not claim the sign-in expired")
+  assert.ok(u.windows.some((w) => w.name === "额度 · 点数余额"), "the general balance is drawn")
 })
 
 test("the shell guard is on the run path, not only on its helper", async () => {
@@ -8376,7 +8406,7 @@ test("a refusal wrapped in data is a refusal on every reader", async () => {
   const expired = await read({ data: { code: 401, message: "Invalid token", token: 0, agent_token: 0 } })
   assert.match(expired.error ?? "", /登录已过期/)
   const refused = await read({ data: { success: false, token: 0, agent_token: 0 } })
-  assert.ok(!refused.windows.some((w) => w.name === "点数余额"), `success:false in the wrapper is not a 0 balance: ${JSON.stringify(refused)}`)
+  assert.ok(!refused.windows.some((w) => w.name === "额度 · 点数余额"), `success:false in the wrapper is not a 0 balance: ${JSON.stringify(refused)}`)
   assert.ok(!String(refused.balance ?? "").includes("0 点 ·"), "and no wallet row is drawn from it")
   const busy = await read({ data: { code: 500, message: "busy", token: 0 } }, { code: 200, balance: 7 })
   assert.equal(busy.balance, "Agent 7 点 可用", "the refused general read leaves the agent figure, not a 0")
@@ -8399,7 +8429,7 @@ test("a status read wrapped in a refusal draws no check-in row, and neither does
       },
       async () => p.auth.usage(auth),
     )
-    assert.ok(!u.windows.some((w) => w.name === "每日签到"), `a refused status draws no row: ${JSON.stringify(status)}`)
+    assert.ok(!u.windows.some((w) => w.name === "说明 · 每日签到"), `a refused status draws no row: ${JSON.stringify(status)}`)
   }
   const u = await withFetch(
     { "/v1/gettoken": { body: { code: 200, token: 300, agent_token: 0 } }, "/api/codar/activities/mine": { body: { code: 200, data: { code: 503, message: "maintenance", data: [{ free_until: until, remaining_quota: null, model_ids: ["m"] }] } } } },
@@ -8840,7 +8870,7 @@ test("a check-in status row reads retry_after from the envelope as well as data"
     "/api/codar/activities/mine": { body: { code: 200, data: [] } },
     "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true }, retry_after: 7200 } },
   }, async () => p.auth.usage(auth))
-  const row = (card.windows ?? []).find((w) => w.name === "每日签到")
+  const row = (card.windows ?? []).find((w) => w.name === "说明 · 每日签到")
   assert.ok(row, "the check-in row is drawn")
   assert.match(row.display, /2 小时后可再领/, "the envelope's wait is stated")
   assert.ok(row.resetsAt, "and it has a moment")
@@ -9145,7 +9175,7 @@ test("the status row reads the first wait that can be stated", async () => {
       { "/v1/gettoken": { body: { code: 200, token: 5, agent_token: 0 } }, "/v1/daily-sign/status": { body }, "/api/codar/activities/mine": { body: { code: 200, data: [] } } },
       async () => p.auth.usage(auth),
     )
-    const row = u.windows.find((w) => w.name === "每日签到")
+    const row = u.windows.find((w) => w.name === "说明 · 每日签到")
     assert.ok(row?.resetsAt > Date.now() + 3000000, label)
   }
   const header = await withFetch(
@@ -9157,7 +9187,7 @@ test("the status row reads the first wait that can be stated", async () => {
     },
     async () => p.auth.usage(auth),
   )
-  assert.ok(header.windows.find((w) => w.name === "每日签到")?.resetsAt > Date.now() + 3000000, "a wait only the header states")
+  assert.ok(header.windows.find((w) => w.name === "说明 · 每日签到")?.resetsAt > Date.now() + 3000000, "a wait only the header states")
 })
 
 test("readers that gate on a business code refuse a refusal in words", async () => {
