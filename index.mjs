@@ -30,7 +30,7 @@
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
 import { isChatCompletionUrl, normalizeChatBody } from "./lib/client-body.mjs"
-import { chatDirect } from "./lib/direct.mjs"
+import { TRANSPORT_HEADER, TRANSPORT_NODE, chatDirect } from "./lib/direct.mjs"
 import { prepareChatBody, renameAnswer } from "./lib/tool-rename.mjs"
 import { messagesToPrompt } from "./lib/chat-bridge.mjs"
 import { modelsFromServe } from "./lib/models-from-serve.mjs"
@@ -241,12 +241,22 @@ const chatTransportOf = (options = {}, session = {}) => async (url, init = {}) =
 //     403 keeps the vendor's own `client_not_supported` beside the one hint that
 //     belongs to it. A stream is never clone()d or read here: the answer is
 //     whatever fetch produced, and the rename wraps it rather than reading it.
+//   - The response says which TLS stack carried it, and never the request. The
+//     client's headers, body and tools are the client's, but the ClientHello was
+//     not (measured 2026-11-21: Bun's fetch is JA3 fae0e5d…, Node's d67b0948…,
+//     the desktop's Go client neither). So a chat now leaves through the same Go
+//     proxy the card's requests use — lib/native.mjs's chatFetch — and answers
+//     with `x-magpie-codar-transport: go-proxy`; a machine with no proxy build
+//     falls back to the ordinary fetch and answers `node`. Chat is never failed
+//     for the transport's sake, and the header is not sent upstream: the vendor
+//     was measured against a client that sends no such header.
 const directTransportOf =
-  (options = {}, token = "", base = `${API}/v1`, fetchImpl = (...args) => globalThis.fetch(...args)) =>
+  (options = {}, token = "", base = `${API}/v1`, fetchImpl = chatFetchOf, fallbackFetch = (...args) => globalThis.fetch(...args)) =>
   async (url, init = {}) => {
     const address = typeof url === "string" ? url : typeof url?.url === "string" ? url.url : String(url)
+    const send = await resolveFetch(fetchImpl, fallbackFetch)
     const raw = bodyTextOf(init.body)
-    if (!isChatCompletionUrl(address)) return await fetchImpl(address, init)
+    if (!isChatCompletionUrl(address)) return await send(address, init)
     // A body the transport cannot read is a body it must not answer with silence
     // — the host sent something, and this says what was wrong instead.
     if (!raw) return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
@@ -256,18 +266,53 @@ const directTransportOf =
     const prepared = prepareChatBody(raw)
     const body = normalizeChatBody(prepared.body, { alignSystem: true })
     if (!body || typeof body !== "string") return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
+    // The transport the request leaves on. It is read from the prepared body for
+    // itself, not from the host's own: the body's `stream` key is the request's,
+    // and a streaming transport that read a JSON answer as an event stream would
+    // fail on a request that is fine.
+    const streaming = streamingOf(body)
     try {
-      const answer = await chatDirect({ baseUrl: base || `${API}/v1`, token: bearerOf(init.headers) || token, body, signal: init.signal, fetchImpl })
+      const answer = await chatDirect({ baseUrl: base || `${API}/v1`, token: bearerOf(init.headers) || token, body, stream: streaming, signal: init.signal, fetchImpl: send })
       // Renamed before the host reads it: a `read_file` reaching DSH is a missing
-      // tool, not a call. A streamed answer leaves here as the vendor's own bytes.
+      // tool, not a call. A streamed answer leaves here as the vendor's own bytes,
+      // and the transport the answer spells stays on it through the rename.
       return renameAnswer(answer, prepared.callerTools)
     } catch (e) {
       // A refusal is the card's own sentence here: the vendor's status when it
       // gave one (a 403 keeps its meaning for whoever reads the reply), 502 when
-      // the request never got an answer at all.
-      return failedAnswer(Number.isInteger(e?.status) ? e.status : 502, whyOf(e))
+      // the request never got an answer at all. The transport travels with it:
+      // the sentence is rebuilt as a Response and the stack that got it is still
+      // worth knowing.
+      return failedAnswer(Number.isInteger(e?.status) ? e.status : 502, whyOf(e), typeof e?.transport === "string" && e.transport ? e.transport : TRANSPORT_NODE)
     }
   }
+
+// resolveFetch settles the transport a loader was built with: a function is
+// itself, a promise is awaited once per request. directTransportOf is handed
+// chatFetchOf itself (the function, not a call) because that is the seam a test
+// replaces — lib/internal.mjs reads testables.chatFetch on every call, so a
+// stubbed transport swapped in after the plugin was built is still the one this
+// request takes, exactly as testables.nativeFetch works for the card's requests.
+// A transport that is not there — chatFetchOf answering null, or a promise that
+// did not resolve to a function — leaves `fallbackFetch`: the road the direct
+// transport was before the proxy existed. Chat is never failed for the
+// transport's sake.
+const resolveFetch = async (fetchImpl, fallbackFetch) => {
+  const picked = typeof fetchImpl === "function" ? await fetchImpl().catch(() => null) : await fetchImpl
+  return typeof picked === "function" ? picked : fallbackFetch
+}
+
+// streamingOf reads the request's own answer shape out of the body that will be
+// sent: `stream:true` is an event stream, anything else one JSON document. It is
+// read from the prepared body rather than from the host's, because that is the
+// body the vendor answers.
+const streamingOf = (body) => {
+  try {
+    return JSON.parse(body)?.stream === true
+  } catch {
+    return false
+  }
+}
 
 // bodyTextOf is the request body as the text that will be sent: a string as it
 // came, bytes decoded once, an already-parsed object serialized (a host that
@@ -330,8 +375,15 @@ const parseBody = (body) => {
 }
 
 // failedAnswer is a bridge failure as a Response the host can put on a line: the
-// status and the sentence, in the JSON error shape an OpenAI client reads.
-const failedAnswer = (status, said) => new Response(JSON.stringify({ error: { message: said, type: "codar_bridge_error" } }), { status, headers: { "Content-Type": "application/json; charset=utf-8" } })
+// status and the sentence, in the JSON error shape an OpenAI client reads. The
+// transport the refusal came back on is stated beside them — a 403 that took the
+// Go proxy and a 403 that fell back to Node are the same vendor sentence and not
+// the same request, and the person reading a card is entitled to know which.
+const failedAnswer = (status, said, transport = TRANSPORT_NODE) =>
+  new Response(JSON.stringify({ error: { message: said, type: "codar_bridge_error" } }), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", [TRANSPORT_HEADER]: transport },
+  })
 
 // claimedCampaigns and claimingCampaign hold the free-model claim down to one
 // write per campaign per process: the key is the account and the activity the

@@ -28,6 +28,7 @@ import { CLIENT_KEY_ORDER, normalizeChatBody } from "../lib/client-body.mjs"
 import { CLIENT_SYSTEM_PREFIX } from "../lib/client-prefix.mjs"
 import { CLIENT_HEADER_NAMES, chatDirect, chatEndpoint, clientHeaders } from "../lib/direct.mjs"
 import { renameAnswer } from "../lib/tool-rename.mjs"
+import { testables } from "../lib/internal.mjs"
 import { CodarPlugin } from "../index.mjs"
 
 // A token shape, not a token: a made-up three-part string, in visible ASCII so
@@ -241,11 +242,25 @@ const hostBody = (extra = {}) =>
     ...extra,
   })
 
+// vendorFetch is the vendor answering through the global fetch. It also pins the
+// loader's chat transport to "none": since 2026-11-21 the direct transport asks
+// lib/native.mjs's chatFetch first (the Go proxy's TLS), and a suite must not
+// spawn a proxy or take a real socket — testables.chatFetch = null is how a
+// test says "there is no proxy build on this machine", the same seam
+// testables.nativeFetch uses for the card's requests (test/direct-proxy.test.mjs
+// is where the two transports are told apart).
 const vendorFetch = (answer = () => sseAnswer()) => {
   const real = globalThis.fetch
   const fetchImpl = recorder(answer)
   globalThis.fetch = fetchImpl
-  return { fetchImpl, restore: () => (globalThis.fetch = real) }
+  testables.chatFetch = null
+  return {
+    fetchImpl,
+    restore: () => {
+      globalThis.fetch = real
+      delete testables.chatFetch
+    },
+  }
 }
 
 test("the loader sends the client's body: key order, effort, stream options, thinking", async () => {

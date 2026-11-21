@@ -27,6 +27,7 @@ import { test } from "node:test"
 
 import { CLIENT_HEADER_NAMES } from "../lib/direct.mjs"
 import { CLIENT_KEY_ORDER } from "../lib/client-body.mjs"
+import { testables } from "../lib/internal.mjs"
 import { callerNameOf } from "../lib/tool-map.mjs"
 import { forgetCalls, prepareChatBody, renameAnswer, renameToolCalls, restoreToolNames } from "../lib/tool-rename.mjs"
 import { TOOL_DEFINITIONS, TOOL_DEFINITIONS_SHA256 } from "../lib/tools/index.mjs"
@@ -113,12 +114,22 @@ const hostBody = ({ tools = ["read", "pwsh", "edit"], messages, ...extra } = {})
 
 const vendorFetch = (answer = () => sseAnswer([])) => {
   // The transport reads the global fetch at call time, so a test swaps it and
-  // restores it. It is the *global* that is swapped: the plugin's own default is
-  // `(...args) => globalThis.fetch(...args)`, evaluated per request.
+  // restores it. The loader's chat transport is pinned to "none" for the same
+  // reason: since 2026-11-21 a chat asks lib/native.mjs's chatFetch first (the
+  // Go proxy's TLS), and a suite must not spawn a proxy or open a socket.
+  // testables.chatFetch = null is that statement, the same seam
+  // testables.nativeFetch uses for the card's requests.
   const real = globalThis.fetch
   const fetchImpl = recorder(answer)
   globalThis.fetch = fetchImpl
-  return { fetchImpl, restore: () => (globalThis.fetch = real) }
+  testables.chatFetch = null
+  return {
+    fetchImpl,
+    restore: () => {
+      globalThis.fetch = real
+      delete testables.chatFetch
+    },
+  }
 }
 
 // ---------- the request side ----------
