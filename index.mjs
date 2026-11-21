@@ -31,6 +31,7 @@ import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
 import { isChatCompletionUrl, normalizeChatBody } from "./lib/client-body.mjs"
 import { chatDirect } from "./lib/direct.mjs"
+import { prepareChatBody, renameAnswer } from "./lib/tool-rename.mjs"
 import { messagesToPrompt } from "./lib/chat-bridge.mjs"
 import { modelsFromServe } from "./lib/models-from-serve.mjs"
 import { chatStream, ensureServe, openAIAnswer, openAIStream, servePortOf } from "./lib/serve.mjs"
@@ -228,10 +229,18 @@ const chatTransportOf = (options = {}, session = {}) => async (url, init = {}) =
 //   - The key is the request's own Authorization when it carries one, else the
 //     account's (the loader's). A host that rotated without rebuilding the loader
 //     must not be answered with the old key.
+//   - The tool table is the client's 44, and the calls that come back are handed
+//     to the host under the host's own names (lib/tool-rename.mjs). Measured on
+//     2026-11-21: the vendor answers the client's table and nothing else (a
+//     prefixed body with a host's own tools, with no tools, or with a single
+//     client tool answers 403 client_not_supported), while a host can only run
+//     the tools it declared itself. The plugin runs neither side — it sends the
+//     table the vendor asked for and renames the calls the model made, so the
+//     host executes them as its own.
 //   - A refusal comes back as a sentence the host can show (failedAnswer), and a
 //     403 keeps the vendor's own `client_not_supported` beside the one hint that
 //     belongs to it. A stream is never clone()d or read here: the answer is
-//     whatever fetch produced.
+//     whatever fetch produced, and the rename wraps it rather than reading it.
 const directTransportOf =
   (options = {}, token = "", base = `${API}/v1`, fetchImpl = (...args) => globalThis.fetch(...args)) =>
   async (url, init = {}) => {
@@ -241,10 +250,17 @@ const directTransportOf =
     // A body the transport cannot read is a body it must not answer with silence
     // — the host sent something, and this says what was wrong instead.
     if (!raw) return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
-    const body = normalizeChatBody(raw, { alignSystem: true })
+    // The caller's tool names are read before the table is replaced, because they
+    // are the vocabulary the answer is renamed into: once the client's 44 leave
+    // (prepareChatBody), the host's own names exist nowhere in the request.
+    const prepared = prepareChatBody(raw)
+    const body = normalizeChatBody(prepared.body, { alignSystem: true })
     if (!body || typeof body !== "string") return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
     try {
-      return await chatDirect({ baseUrl: base || `${API}/v1`, token: bearerOf(init.headers) || token, body, signal: init.signal, fetchImpl })
+      const answer = await chatDirect({ baseUrl: base || `${API}/v1`, token: bearerOf(init.headers) || token, body, signal: init.signal, fetchImpl })
+      // Renamed before the host reads it: a `read_file` reaching DSH is a missing
+      // tool, not a call. A streamed answer leaves here as the vendor's own bytes.
+      return renameAnswer(answer, prepared.callerTools)
     } catch (e) {
       // A refusal is the card's own sentence here: the vendor's status when it
       // gave one (a 403 keeps its meaning for whoever reads the reply), 502 when

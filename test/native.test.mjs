@@ -1593,8 +1593,15 @@ test("a release ships each build as its own package, and the main package names 
   // reached says nothing about the preflight: a dropped TLS connection is not
   // a wrong answer. A network failure skips these three reads with a note; an
   // assertion failure is still a failure.
+  //
+  // The tokens below are the preflight's own words for "no answer arrived", not
+  // only the socket's: its child has a 10 s clock, and on a machine running the
+  // whole suite at once the read of a packument can outlast it. That clock used
+  // to surface as "the registry answered the registry did not answer within
+  // 10 s", which matched nothing here and turned a slow network into a red run
+  // — the one thing this block exists to prevent.
   if (process.env.CODAR_OFFLINE !== "1") {
-    const unreachable = /socket disconnected|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|ECONNREFUSED|certificate|Client network/i
+    const unreachable = /socket disconnected|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|ECONNREFUSED|EAGAIN|certificate|Client network|gave no answer|did not answer within/i
     try {
       assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-x64" }], "0.3.0"), ["magpie-plugin-codar-darwin-x64"], "a taken version was not seen as taken")
       assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-x64" }], "9.9.99"), [], "an unpublished version was seen as taken")

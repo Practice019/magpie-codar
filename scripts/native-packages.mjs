@@ -235,7 +235,12 @@ export function took(wrote, version, { registry = process.env.npm_config_registr
     // in front of, not pass it with "a version nobody could ask about".
     const got = spawnSync(process.execPath, ["-e", readPackument, `${base}/${p.name}`, p.name], { encoding: "utf8", timeout: 30000 })
     if (got.error || got.status !== 0) {
-      throw new Error(`${p.name}: the registry at ${base} could not be asked (${got.error?.message ?? `the child exited ${got.status}`}); nothing was published`)
+      // The child's own words, not just its exit code: a spawn that was refused
+      // (EAGAIN under a loaded machine) and a child that died both land here,
+      // and "the child exited 1" alone names neither.
+      const died = String(got.stderr ?? "").trim().split("\n").filter(Boolean).at(-1)
+      const why = got.error?.message ?? `the child exited ${got.status}${died ? `: ${died}` : ""}`
+      throw new Error(`${p.name}: the registry at ${base} could not be asked (${why}); nothing was published`)
     }
     let doc
     try {
@@ -244,7 +249,16 @@ export function took(wrote, version, { registry = process.env.npm_config_registr
       doc = undefined
     }
     if (!doc) throw new Error(`${p.name}: the registry at ${base} did not answer with a version list; nothing was published`)
-    if (doc.error && doc.error !== 404) throw new Error(`${p.name}: the registry answered ${doc.error}`)
+    if (doc.error && doc.error !== 404) {
+      // Two different things arrive here. A number is the registry answering —
+      // 401, 500 — a fact about the publish. A string is the child saying the
+      // request never got an answer at all: a dropped connection, or its own
+      // 10 s clock. Only the second is "the registry was not reachable", and a
+      // caller reporting that as "the artifact is wrong" sends the reader after
+      // the wrong thing, so the two are said differently.
+      const why = typeof doc.error === "number" ? `the registry answered ${doc.error}` : `the registry gave no answer (${doc.error})`
+      throw new Error(`${p.name}: ${why}; nothing was published`)
+    }
     // versions is an array of the published versions, as the child printed it.
     if (Array.isArray(doc?.versions) && doc.versions.includes(version)) taken.push(p.name)
   }

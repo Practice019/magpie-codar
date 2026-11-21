@@ -7252,6 +7252,13 @@ test("every file the package ships is one the gate would notice missing", async 
   // without the gate saying anything — the packed suite then fails deep
   // inside, or, for a file only the Go tests read, not at all. The two lists
   // are kept the same size, LICENSE aside: nothing installs it.
+  //
+  // There used to be an exemption here for the session ledger's three entries,
+  // which `files` named before the modules existed. `files` no longer names
+  // them (`lib/session-map.mjs`, `test/session-map.test.mjs` and
+  // `scripts/acceptance-cache.mjs` are in neither the manifest nor the tree),
+  // so there is nothing left to exempt: a shipped file that the gate does not
+  // require is a failure again, for every file, with no list to keep in step.
   const { fileURLToPath } = await import("node:url")
   const { requiredFiles } = await import("../scripts/tarball.mjs")
   const here = fileURLToPath(new URL("..", import.meta.url))

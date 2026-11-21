@@ -300,20 +300,23 @@ export const requiredFiles = [
   "lib/client-prefix.mjs",
   "lib/client-prefix-data.mjs",
   "lib/direct.mjs",
+  // The tool rename: index.mjs's direct transport sends the client's 44 and hands
+  // the model's calls back under the host's own names. lib/tool-rename.mjs is the
+  // transport's import and lib/tool-map.mjs is its table, so a tarball missing
+  // either fails at load; they are listed so the gate names the file.
+  "lib/tool-rename.mjs",
+  "lib/tool-map.mjs",
   "lib/client-system.mjs",
   "lib/client-system-data.mjs",
   "lib/guarded.mjs",
   // The serve bridge and the two modules that feed it: the loader's fetch is
-  // lib/serve.mjs, the conversation it carries is lib/chat-bridge.mjs, the model
-  // list it reads is lib/models-from-serve.mjs, and lib/session-map.mjs is the
-  // ledger that names one codar session per caller conversation and decides how
-  // much of the conversation still has to travel. All four are imported by
+  // lib/serve.mjs, the conversation it carries is lib/chat-bridge.mjs, and the
+  // model list it reads is lib/models-from-serve.mjs. All three are imported by
   // index.mjs, so a tarball missing one fails at load; they are listed here so
   // the gate refuses to run without them rather than the suite failing deep.
   "lib/serve.mjs",
   "lib/chat-bridge.mjs",
   "lib/models-from-serve.mjs",
-  "lib/session-map.mjs",
   "native/binary-name.mjs",
   // The local tool layer: the 44 definitions the conversation forwards and the
   // nine implementations this cut has. lib/tools/catalog.mjs imports every
@@ -344,10 +347,6 @@ export const requiredFiles = [
   // symptom should be able to run the same check on their own machine instead of
   // inferring it from the code.
   "scripts/acceptance-session.mjs",
-  // The cache acceptance run: one caller's conversation through the real bridge,
-  // three requests in a row, asserting the session is the same one and that the
-  // server's own usage.log shows a cache hit on the second and third.
-  "scripts/acceptance-cache.mjs",
   // The prefix generator: lib/client-prefix-data.mjs is its output, and a
   // checkout that has the capture can re-run it to prove the constant still is
   // the capture's first four segments.
@@ -356,6 +355,10 @@ export const requiredFiles = [
   // through the plugin's loader against the vendor's gateway, printing the status,
   // the content and the body's top-level key order.
   "scripts/acceptance-direct.mjs",
+  // The tool-boundary acceptance run: one real turn with a host-shaped tool
+  // table, printing the response's status and the tool_calls' names before and
+  // after the rename. It ships so the same check can be run on another machine.
+  "scripts/acceptance-tools.mjs",
   "scripts/native-packages.mjs",
   "native/go.mod",
   "native/cmd/codar-proxy/main.go",
@@ -367,10 +370,11 @@ export const requiredFiles = [
   "test/client-body.test.mjs",
   "test/client-prefix.test.mjs",
   "test/direct.test.mjs",
+  "test/tool-map.test.mjs",
+  "test/tool-rename.test.mjs",
   "test/client-system.test.mjs",
   "test/serve.test.mjs",
   "test/chat-bridge.test.mjs",
-  "test/session-map.test.mjs",
   "README.md",
   "CHANGELOG.md",
 ]

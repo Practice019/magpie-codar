@@ -27,6 +27,7 @@ import { test } from "node:test"
 import { CLIENT_KEY_ORDER, normalizeChatBody } from "../lib/client-body.mjs"
 import { CLIENT_SYSTEM_PREFIX } from "../lib/client-prefix.mjs"
 import { CLIENT_HEADER_NAMES, chatDirect, chatEndpoint, clientHeaders } from "../lib/direct.mjs"
+import { renameAnswer } from "../lib/tool-rename.mjs"
 import { CodarPlugin } from "../index.mjs"
 
 // A token shape, not a token: a made-up three-part string, in visible ASCII so
@@ -270,18 +271,26 @@ test("the loader sends the client's body: key order, effort, stream options, thi
   }
 })
 
-test("the caller's tools cross over byte for byte", async () => {
+test("the caller's tools are replaced by the client's 44, and its names are kept for the answer", async () => {
   const { fetchImpl, restore } = vendorFetch()
-  const tools = [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }]
+  const tools = [{ type: "function", function: { name: "read", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }]
   const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true, tools })
   try {
     const loader = await loadPlugin({ transport: "direct" })
     await loader.fetch("https://api.claw.speedai.com/v1/chat/completions", { method: "POST", body })
-    const raw = fetchImpl.seen[0].init.body
-    // The array as the host wrote it, character for character: the tools are the
-    // agent's own table, and a re-serialized copy is a different table.
-    assert.ok(raw.includes(JSON.stringify(tools)), "the tools array is the caller's own text")
-    assert.deepEqual(JSON.parse(raw).tools, tools)
+    const sent = JSON.parse(fetchImpl.seen[0].init.body)
+    // The caller's table does not cross over any more, and this is the measurement
+    // that says so (2026-11-21, a real account): a prefixed body whose tools are
+    // the host's own answers 403 client_not_supported, and one carrying a single
+    // client tool answers the same. The 44 are the only table that passes, so
+    // they are what leaves; lib/tool-rename.mjs renames the calls that come back.
+    assert.equal(sent.tools.length, 44)
+    assert.ok(!sent.tools.some((tool) => tool.function.name === "read"), "the caller's own tool is not in the body")
+    assert.ok(sent.tools.some((tool) => tool.function.name === "read_file"), "the client's tool is")
+    // The caller's vocabulary is not lost: it is what the answer is renamed into,
+    // and the rename tests measure that half.
+    const assisted = await (await renameAnswer(jsonAnswer({ choices: [{ message: { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }] } }] }), new Set(tools.map((t) => t.function.name)))).json()
+    assert.equal(assisted.choices[0].message.tool_calls[0].function.name, "read")
   } finally {
     restore()
   }
