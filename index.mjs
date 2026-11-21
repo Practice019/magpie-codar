@@ -29,6 +29,8 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
+import { isChatCompletionUrl, normalizeChatBody } from "./lib/client-body.mjs"
+import { chatDirect } from "./lib/direct.mjs"
 import { messagesToPrompt } from "./lib/chat-bridge.mjs"
 import { modelsFromServe } from "./lib/models-from-serve.mjs"
 import { chatStream, ensureServe, openAIAnswer, openAIStream, servePortOf } from "./lib/serve.mjs"
@@ -124,10 +126,15 @@ const verifyPendingOf = (e, username) => {
   }
 }
 
-// chatTransport is the fetch the host is handed for chat, and it is the
-// bridge to the desktop app's own local server (lib/serve.mjs).
+// chatTransport is the fetch the host is handed for chat when `codar.transport`
+// says "serve": the bridge to the desktop app's own local server
+// (lib/serve.mjs). The direct transport below is the default now — the gateway's
+// client check was measured down to the system prefix, so no app has to be
+// installed — and this road is kept because it is the one a person can fall back
+// to when a direct request is refused, and because it is how the two were
+// compared.
 //
-// The reason is measured, not a preference: a direct call to the gateway is
+// The reason it exists, and what it cost: a direct call to the gateway is
 // refused for every client that is not the app — HTTP 403
 // {"code":"client_not_supported","message":"This login credential is
 // restricted to Codar."} — whatever headers or body it copies (2026-11-21, the
@@ -197,6 +204,94 @@ const chatTransportOf = (options = {}, session = {}) => async (url, init = {}) =
     return failedAnswer(e?.status === 400 ? 400 : 502, whyOf(e))
   }
 }
+
+// directTransportOf is the fetch the host is handed by default: the vendor's own
+// gateway, with no `codar.exe serve` in between.
+//
+// The 403 that chatTransportOf exists for was read as "is this the app's
+// process?". It is not. Measured on two accounts (2026-11-21), varying only the
+// system message's length: one 49-character segment is refused with
+// `client_not_supported`, four segments (~1.6 KB) are answered 200, and so is the
+// whole 33 KB prompt; and 33 KB with no tools and one short message is also 200.
+// So the conversation goes straight to api.claw.speedai.com with the client's
+// prefix in front of the caller's system prompt (lib/client-prefix.mjs), the
+// client's seven-key body (lib/client-body.mjs) and the client's six headers
+// (lib/direct.mjs). No app has to be installed, and no 19 KB app prompt is paid
+// on every session.
+//
+// Three things this function decides, and none of them is a preference:
+//
+//   - A chat completion is reshaped and prefixed. Anything else — /v1/messages
+//     for the claude family, a route the catalog introduced — is handed to fetch
+//     exactly as the host wrote it: there is no capture of its body, and what
+//     cannot be made the same is left alone.
+//   - The key is the request's own Authorization when it carries one, else the
+//     account's (the loader's). A host that rotated without rebuilding the loader
+//     must not be answered with the old key.
+//   - A refusal comes back as a sentence the host can show (failedAnswer), and a
+//     403 keeps the vendor's own `client_not_supported` beside the one hint that
+//     belongs to it. A stream is never clone()d or read here: the answer is
+//     whatever fetch produced.
+const directTransportOf =
+  (options = {}, token = "", base = `${API}/v1`, fetchImpl = (...args) => globalThis.fetch(...args)) =>
+  async (url, init = {}) => {
+    const address = typeof url === "string" ? url : typeof url?.url === "string" ? url.url : String(url)
+    const raw = bodyTextOf(init.body)
+    if (!isChatCompletionUrl(address)) return await fetchImpl(address, init)
+    // A body the transport cannot read is a body it must not answer with silence
+    // — the host sent something, and this says what was wrong instead.
+    if (!raw) return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
+    const body = normalizeChatBody(raw, { alignSystem: true })
+    if (!body || typeof body !== "string") return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
+    try {
+      return await chatDirect({ baseUrl: base || `${API}/v1`, token: bearerOf(init.headers) || token, body, signal: init.signal, fetchImpl })
+    } catch (e) {
+      // A refusal is the card's own sentence here: the vendor's status when it
+      // gave one (a 403 keeps its meaning for whoever reads the reply), 502 when
+      // the request never got an answer at all.
+      return failedAnswer(Number.isInteger(e?.status) ? e.status : 502, whyOf(e))
+    }
+  }
+
+// bodyTextOf is the request body as the text that will be sent: a string as it
+// came, bytes decoded once, an already-parsed object serialized (a host that
+// parses the body itself hands one over). A Request body is not read here: the
+// host does not hand one to a loader's fetch, and reading it twice would be the
+// one thing worse than not reading it.
+const bodyTextOf = (body) => {
+  if (typeof body === "string") return body
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body)
+  if (body && typeof body === "object" && typeof body.text !== "function" && typeof body.arrayBuffer !== "function") return JSON.stringify(body)
+  return ""
+}
+
+// bearerOf is the key on the request the host built, in the two spellings the
+// clients use: `authorization: Bearer <key>` and Anthropic's `x-api-key`. A
+// Headers object and the init's plain object are both accepted, because which one
+// a host uses is not something a plugin gets to decide.
+const bearerOf = (headers) => {
+  if (!headers || typeof headers !== "object") return ""
+  const at = (name) => {
+    if (typeof headers.get === "function") {
+      const value = headers.get(name)
+      return typeof value === "string" ? value.trim() : ""
+    }
+    const found = Object.keys(headers).find((key) => key.toLowerCase() === name)
+    const value = found ? headers[found] : ""
+    return typeof value === "string" ? value.trim() : ""
+  }
+  const bearer = /^Bearer\s+(\S+)$/i.exec(at("authorization"))
+  return bearer ? bearer[1] : at("x-api-key")
+}
+
+// transportOf is the road a loader hands the host, chosen by `codar.transport`
+// (readOptions): direct by default, the desktop app's server when the option says
+// "serve". Both are built per plugin instance; only one of them needs the key,
+// and only one of them needs the session.
+const transportOf = (options, token, session, base) =>
+  options?.transport === "serve" ? chatTransportOf(options, session) : directTransportOf(options, token, base)
+
+
 
 // modelOfBody is the model the chunks name: the one the caller asked for, so a
 // client showing "model: auto" over an answer is showing what it asked for. The
@@ -320,6 +415,16 @@ const readOptions = (input) => {
     // dropped and the default stands: a typo must not become a ceiling of 0,
     // which would send an empty prompt.
     ...(Number.isFinite(maxPrompt) && maxPrompt > 0 ? { maxPromptChars: Math.floor(maxPrompt) } : {}),
+    // Which road the conversation takes. The default is "direct" — the vendor's
+    // own gateway, with the client's prefix in front of the system prompt and the
+    // app's six headers (lib/direct.mjs; the measurement that made it possible is
+    // in lib/client-prefix.mjs). "serve" is the old bridge through the desktop
+    // app's local server (lib/serve.mjs), kept because it is the one road a
+    // person can fall back to on a machine where the direct request is refused,
+    // and because it is how the two are compared. Only the exact word "serve"
+    // chooses it: a typo must not put a machine that works on a road that needs
+    // an app installed, and a typo must not silently pick the road that does not.
+    transport: given.transport === "serve" ? "serve" : "direct",
   }
 }
 
@@ -722,7 +827,11 @@ export async function CodarPlugin(input) {
         }
         const token = tokenOf(got)
         if (!token) return {}
-        return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: chatTransportOf(pluginOptions, pluginSession) }
+        // Which road this request takes: `codar.transport` (readOptions), direct
+        // by default. The base is read here rather than captured at build time
+        // because the models hook may have written the user's own address onto it
+        // since; a loader that runs again picks that up.
+        return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: transportOf(pluginOptions, token, pluginSession, loaderBase) }
       },
 
       // Check-in: POST /v1/daily-sign. The server distinguishes "claimed"

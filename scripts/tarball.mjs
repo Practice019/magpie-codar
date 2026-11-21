@@ -293,6 +293,13 @@ export const requiredFiles = [
   "lib/signinpage.mjs",
   "lib/native.mjs",
   "lib/client-body.mjs",
+  // The direct transport and the client's prefix it sends: index.mjs imports both
+  // (lib/direct.mjs is the request, lib/client-prefix.mjs the four segments in
+  // front of the caller's system prompt, lib/client-prefix-data.mjs the generated
+  // bytes). A tarball missing one fails at load, so they are listed here.
+  "lib/client-prefix.mjs",
+  "lib/client-prefix-data.mjs",
+  "lib/direct.mjs",
   "lib/client-system.mjs",
   "lib/client-system-data.mjs",
   "lib/guarded.mjs",
@@ -341,6 +348,14 @@ export const requiredFiles = [
   // three requests in a row, asserting the session is the same one and that the
   // server's own usage.log shows a cache hit on the second and third.
   "scripts/acceptance-cache.mjs",
+  // The prefix generator: lib/client-prefix-data.mjs is its output, and a
+  // checkout that has the capture can re-run it to prove the constant still is
+  // the capture's first four segments.
+  "scripts/gen-client-prefix.mjs",
+  // The direct road's acceptance run: one non-streaming and one streaming request
+  // through the plugin's loader against the vendor's gateway, printing the status,
+  // the content and the body's top-level key order.
+  "scripts/acceptance-direct.mjs",
   "scripts/native-packages.mjs",
   "native/go.mod",
   "native/cmd/codar-proxy/main.go",
@@ -350,6 +365,8 @@ export const requiredFiles = [
   "test/native.test.mjs",
   "test/guarded.test.mjs",
   "test/client-body.test.mjs",
+  "test/client-prefix.test.mjs",
+  "test/direct.test.mjs",
   "test/client-system.test.mjs",
   "test/serve.test.mjs",
   "test/chat-bridge.test.mjs",

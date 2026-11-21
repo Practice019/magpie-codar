@@ -6549,14 +6549,17 @@ test("the auth hook carries a loader, and it hands the request the account's key
   assert.deepEqual(await p.auth.loader(async () => undefined), {}, "and no auth at all is the same")
 
   // The fetch the loader answers is handed to the host and used in place of
-  // its own, and it no longer carries the conversation to the gateway: the
-  // vendor refuses every client that is not the app (lib/serve.mjs's header
-  // says which 403, and why the same credential asked through `codar serve`
-  // answers 200). With no server listening, the answer is a bridge failure with
-  // a sentence, not a silent stream and not a request to the vendor: this is the
-  // one thing the host must never see as "nothing happened".
+  // its own. Which road that fetch takes is `codar.transport`: this block pins
+  // the old one, asked for by name — the desktop app's server (lib/serve.mjs),
+  // which the vendor admits and the gateway does not. With no server listening,
+  // the answer is a bridge failure with a sentence, not a silent stream and not
+  // a request to the vendor: this is the one thing the host must never see as
+  // "nothing happened". The direct road is the default and has its own file
+  // (test/direct.test.mjs), where the request does reach the gateway.
+  const serveOnly = await CodarPlugin({ codar: { transport: "serve" } })
+  const bridged = await serveOnly.auth.loader(async () => auth())
   const answered = await withFetch({ "/v1/chat/completions": { body: { via: "fetch" } } }, async (calls) => {
-    const res = await first.fetch("https://api.claw.speedai.com/v1/chat/completions", {
+    const res = await bridged.fetch("https://api.claw.speedai.com/v1/chat/completions", {
       method: "POST",
       body: JSON.stringify({ model: "auto", stream: false, messages: [{ role: "user", content: "hi" }] }),
     })

@@ -190,7 +190,10 @@ const auth = async () => ({ type: "api", key: TOKEN })
 // "function" ? o.fetch : fetch`). Everything below goes through that one
 // function, so the test covers the road the host takes and not a copy of it.
 const loaderFetch = async (fake, body, { stream = true, model = "auto" } = {}) => {
-  const p = await CodarPlugin({ codar: { port: fake.port, bin: process.env.CODAR_BIN || codarServeExecutable() } })
+  // `transport: "serve"` is asked for by name: the default road is the direct
+  // one now (lib/direct.mjs), and this file is about the bridge — the road that
+  // asks the app's own server on loopback instead.
+  const p = await CodarPlugin({ codar: { transport: "serve", port: fake.port, bin: process.env.CODAR_BIN || codarServeExecutable() } })
   const opts = await p.auth.loader(auth)
   const res = await opts.fetch(`http://127.0.0.1:${fake.port}/v1/chat/completions`, {
     method: "POST",
@@ -319,7 +322,7 @@ test("end to end: a server that will not start is an error the host can show", a
   // that threw a bare TypeError made magpie show the bridge's stack instead of
   // a sentence a person can act on.
   const port = await deadPort()
-  const p = await CodarPlugin({ codar: { port, bin: "C:\\nowhere\\codar.exe", serveTimeoutMs: 120 } })
+  const p = await CodarPlugin({ codar: { transport: "serve", port, bin: "C:\\nowhere\\codar.exe", serveTimeoutMs: 120 } })
   const opts = await p.auth.loader(auth)
   const res = await opts.fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST",
