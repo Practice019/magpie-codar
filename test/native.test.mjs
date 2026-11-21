@@ -1471,8 +1471,15 @@ test("the plugin opens the proxy from the platform package that was installed", 
   mkdirSync(join(dir, "lib"))
   mkdirSync(join(dir, "native", "bin"), { recursive: true })
   // The plugin's own modules, so the lookup runs as the installed package does
-  // — one scratch directory's layout, not the checkout's.
-  for (const f of readdirSync(join(here, "..", "lib"))) copyFileSync(join(here, "..", "lib", f), join(dir, "lib", f))
+  // — one scratch directory's layout, not the checkout's. Only files are
+  // copied: since lib/tools/ arrived, lib/ holds a directory too, and
+  // copyFileSync on one is EPERM — which read as "the lookup cannot find the
+  // installed package" and hid the real reason for a red run. The subdirectory
+  // is copied whole, because the lookup loads it if it ever reaches its import.
+  for (const f of readdirSync(join(here, "..", "lib"), { withFileTypes: true })) {
+    if (f.isDirectory()) cpSync(join(here, "..", "lib", f.name), join(dir, "lib", f.name), { recursive: true })
+    else copyFileSync(join(here, "..", "lib", f.name), join(dir, "lib", f.name))
+  }
   copyFileSync(join(here, "..", "native", "binary-name.mjs"), join(dir, "native", "binary-name.mjs"))
   const name = packageName("darwin", "arm64")
   const pkg = join(dir, "node_modules", name)
