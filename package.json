@@ -29,6 +29,7 @@
     "scripts/tarball.mjs",
     "scripts/build-native.mjs",
     "scripts/extract-client-system.mjs",
+    "scripts/acceptance-session.mjs",
     "native/go.mod",
     "native/cmd/codar-proxy/main.go",
     "native/cmd/codar-proxy/main_test.go",

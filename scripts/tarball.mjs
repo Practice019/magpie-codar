@@ -310,6 +310,12 @@ export const requiredFiles = [
   "scripts/tarball.mjs",
   "scripts/build-native.mjs",
   "scripts/extract-client-system.mjs",
+  // The incident's acceptance run: three conversations through the real bridge
+  // against the app's own server, asserting three distinct sessions and a prompt
+  // count that does not grow. It ships because someone debugging the same
+  // symptom should be able to run the same check on their own machine instead of
+  // inferring it from the code.
+  "scripts/acceptance-session.mjs",
   "scripts/native-packages.mjs",
   "native/go.mod",
   "native/cmd/codar-proxy/main.go",

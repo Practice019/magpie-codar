@@ -149,15 +149,27 @@ const verifyPendingOf = (e, username) => {
 // can show (an error chunk, or a failed Response with the sentence), because a
 // stream that stays open over a conversation that is already over is the worst
 // thing this bridge could hand the host.
-const chatTransportOf = (options = {}) => async (url, init = {}) => {
+const chatTransportOf = (options = {}, session = {}) => async (url, init = {}) => {
   // `options` is the plugin's own settings, handed in by the loader: this
   // function is built per plugin instance (see the loader), so the port and the
   // binary are the instance's, not a module-level default.
+  //
+  // `session` is the conversation's session across calls (lib/serve.mjs's
+  // serveSessionOf): with `codar.session: "reuse"` it carries the id from
+  // request to request, and with the default it is not consulted at all — every
+  // request names a new one. It is passed rather than read inside chatStream so
+  // that a test can hold its own, and so the id survives this function being
+  // rebuilt (the loader runs again whenever a sign-in changes).
   const body = parseBody(init.body)
   // A request the bridge cannot read is a request it must not answer with
   // silence: the host sent something, and the answer says what was wrong.
   if (!body || typeof body !== "object") return failedAnswer(400, "没有可转发的对话：请求体不是 JSON")
-  const message = messagesToPrompt(body.messages)
+  // The whole conversation magpie sent, in the one string the server takes, cut
+  // in the middle past the ceiling (MAX_PROMPT_CHARS, or the plugin's own
+  // `codar.maxPromptChars`). Measured 2026-11-21: one request reached
+  // prompt_tokens: 517961 by carrying a stack of tool loops whole; a cut is the
+  // guard rail for that, and a conversation that fits is untouched.
+  const message = messagesToPrompt(body.messages, { maxChars: options.maxPromptChars })
   if (!message) return failedAnswer(400, "没有可发送的内容：这次请求没有消息")
   const port = servePortOf(options)
   // The server is ensured per request, not per process: the person may have
@@ -166,7 +178,10 @@ const chatTransportOf = (options = {}) => async (url, init = {}) => {
   // later either way, so this cannot wait forever.
   const ready = await ensureServe({ port, bin: options.bin || undefined, home: options.home, timeoutMs: options.serveTimeoutMs })
   if (!ready.ok) return failedAnswer(502, ready.reason)
-  const events = chatStream({ port, message })
+  // chatStream names the session, interrupts a session that is still busy, and
+  // retries a run that errored on a fresh one (see its own comment for the
+  // incident). Its thrown errors are the ones that survived those retries.
+  const events = chatStream({ port, message, session })
   try {
     // A stream:false client asked for the whole answer at once; every other
     // client (and a client that said nothing about stream, as OpenAI's own
@@ -176,8 +191,9 @@ const chatTransportOf = (options = {}) => async (url, init = {}) => {
   } catch (e) {
     // The server refused before the first event: HTTP 400 {"error":"message is
     // required"} for a body it cannot read, a 405 for a route it does not have,
-    // or a port that went away between the probe and the request. The person
-    // gets the server's own sentence instead of a stream that never speaks.
+    // a port that went away between the probe and the request, or a session that
+    // was replaced under this request (SESSION_MISMATCH). The person gets the
+    // server's own sentence instead of a stream that never speaks.
     return failedAnswer(e?.status === 400 ? 400 : 502, whyOf(e))
   }
 }
@@ -293,12 +309,30 @@ const readOptions = (input) => {
   const given = source.codar && typeof source.codar === "object" ? source.codar : {}
   const port = Number(given.port ?? process.env.CODAR_SERVE_PORT)
   const timeout = Number(given.serveTimeoutMs)
+  const maxPrompt = Number(given.maxPromptChars)
   return {
     ...(Number.isInteger(port) && port > 0 && port < 65536 ? { port } : {}),
     ...(typeof given.bin === "string" && given.bin.trim() ? { bin: given.bin } : {}),
     ...(typeof given.home === "string" && given.home ? { home: given.home } : {}),
     ...(Number.isFinite(timeout) && timeout > 0 ? { serveTimeoutMs: timeout } : {}),
+    // The message's ceiling, when the person set one (messagesToPrompt's own
+    // MAX_PROMPT_CHARS is the default). A value that is not a positive number is
+    // dropped and the default stands: a typo must not become a ceiling of 0,
+    // which would send an empty prompt.
+    ...(Number.isFinite(maxPrompt) && maxPrompt > 0 ? { maxPromptChars: Math.floor(maxPrompt) } : {}),
   }
+}
+
+// sessionOf reads the conversation mode the person set: `codar.session:"reuse"`
+// says the server may keep one session's history across this plugin instance's
+// requests (the model then remembers the thread by itself); anything else — the
+// default — is one session per request, which is what the incident's fix needs
+// (see lib/serve.mjs's session comment). The object returned is the one every
+// request of this instance shares, so `{"session":"reuse"}` genuinely means one
+// session for the instance and not one per fetch.
+const sessionOf = (input) => {
+  const given = input?.codar && typeof input.codar === "object" ? input.codar : {}
+  return { session: given.session === "reuse" ? "reuse" : "new" }
 }
 
 export async function CodarPlugin(input) {
@@ -334,6 +368,11 @@ export async function CodarPlugin(input) {
   // host hands the plugin its settings at build time and a host reload is a new
   // instance.
   const pluginOptions = readOptions(input)
+  // The conversation's session across this instance's requests (chatTransportOf's
+  // `session`): built once here, because the loader runs again on every sign-in
+  // change and a piece of memory that is rebuilt is not memory. With the default
+  // mode it is never read — lib/serve.mjs names a new session per request.
+  const pluginSession = sessionOf(input)
 
   return {
     auth: {
@@ -683,7 +722,7 @@ export async function CodarPlugin(input) {
         }
         const token = tokenOf(got)
         if (!token) return {}
-        return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: chatTransportOf(pluginOptions) }
+        return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: chatTransportOf(pluginOptions, pluginSession) }
       },
 
       // Check-in: POST /v1/daily-sign. The server distinguishes "claimed"

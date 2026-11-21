@@ -140,18 +140,28 @@ const fakeServe = async ({ chat } = {}) => {
     req.on("data", (c) => chunks.push(c))
     req.on("end", () => {
       const text = Buffer.concat(chunks).toString("utf8")
-      requests.push({ method: req.method, path: req.url, body: text ? JSON.parse(text) : null })
+      const body = text ? JSON.parse(text) : null
+      requests.push({ method: req.method, path: req.url, body })
+      if (req.method === "GET" && req.url === "/api/chat/runs") {
+        // the server's own answer on a machine with nothing running (measured)
+        res.writeHead(200, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ runs: [] }))
+        return
+      }
       if (req.method === "GET" && req.url === "/api/desktop/settings") {
         res.writeHead(200, { "Content-Type": "application/json" })
         res.end(JSON.stringify(settings))
         return
       }
       if (req.method === "POST" && req.url === "/api/chat") {
+        // the run's events name the session the request named (measured: a
+        // request with session_id answers events with that session_id)
+        const forSession = EVENTS.map((e) => ({ ...e, session_id: body?.session_id ?? e.session_id }))
         ;(chat ?? ((r) => {
           r.writeHead(200, { "Content-Type": "text/event-stream" })
-          for (const e of EVENTS) r.write(`data: ${JSON.stringify(e)}\n\n`)
+          for (const e of forSession) r.write(`data: ${JSON.stringify(e)}\n\n`)
           r.end()
-        }))(res)
+        }))(res, body)
         return
       }
       res.writeHead(404, { "Content-Type": "application/json" })
@@ -208,8 +218,9 @@ test("end to end: a streaming chat is an OpenAI event stream of at least two dat
     assert.ok(lines.length >= 2, `only ${lines.length} data lines`)
     assert.equal(fake.requests.filter((r) => r.path === "/api/chat").length, 1, "one conversation, one request")
     const sent = fake.requests.find((r) => r.path === "/api/chat").body
-    assert.deepEqual(Object.keys(sent), ["message"], "the server's one field, and nothing else")
+    assert.deepEqual(Object.keys(sent).sort(), ["message", "session_id"], "the server's two fields, and nothing else")
     assert.equal(sent.message, `${DEBUG_POINT}\n\n说成功`)
+    assert.match(sent.session_id, /^mw-[a-z0-9]+$/, "and the session this conversation is")
     const chunks = lines.map((l) => l.slice(6)).filter((d) => d.trim() !== "[DONE]").map((d) => JSON.parse(d))
     assert.equal(chunks.map((c) => c.choices[0].delta?.content ?? "").join(""), "成功")
     assert.ok(text.trimEnd().endsWith("data: [DONE]"))
@@ -243,6 +254,11 @@ test("end to end: the server's error event reaches magpie as an error, not as a 
   // The failure this bridge was written to avoid: an account out of points
   // answers an `error` event whose code is insufficient_quota, and the stream
   // ends. A host that is handed a stream that simply stops waits forever.
+  //
+  // The bridge retries an error event once on a fresh session now (lib/serve.mjs's
+  // session retry), so this fixture answers the same error to every attempt: what
+  // is asserted is the answer the person ends up with — the vendor's code, and an
+  // end to the stream — not how many times the server was asked.
   const fake = await fakeServe({
     chat: (res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -257,8 +273,41 @@ test("end to end: the server's error event reaches magpie as an error, not as a 
     const chunks = text.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).filter((d) => d.trim() !== "[DONE]").map((d) => JSON.parse(d))
     const closing = chunks.find((c) => c.choices?.[0]?.finish_reason)
     assert.ok(closing, "the stream closed")
+    assert.equal(closing.choices[0].finish_reason, "error", "an error is not a normal end")
+    // The sentence the person reads: what was tried (a new session), the
+    // vendor's own words in brackets, and the code the vendor gave.
     assert.equal(closing.error?.code, "insufficient_quota", "and said what went wrong")
+    assert.match(String(closing.error?.message), /已自动切新会话重试/, "the person is told the retry happened")
+    assert.match(String(closing.error?.message), /Not enough points/, "the vendor's sentence survives the retry")
     assert.ok(text.trimEnd().endsWith("data: [DONE]"), "the client sees an end")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("end to end: each request names its own session, and the body says so", async () => {
+  // Where the incident meets the host's own road: the loader's fetch is the
+  // only thing magpie calls for a conversation, and every call of it must name
+  // a session — a body without one is the server's one fixed `web-ui`, which is
+  // how every conversation of the day ended up in one place (517961
+  // prompt_tokens). Two requests, two sessions; and the host's messages arrive
+  // in the message field as before.
+  const fake = await fakeServe()
+  try {
+    for (const text of ["第一轮", "第二轮"]) {
+      const res = await loaderFetch(fake, [{ role: "user", content: text }])
+      await res.text()
+    }
+    const chats = fake.requests.filter((r) => r.path === "/api/chat")
+    assert.equal(chats.length, 2)
+    assert.ok(chats.every((r) => /^mw-[a-z0-9]+$/.test(r.body.session_id ?? "")), "every request named a session")
+    assert.notEqual(chats[0].body.session_id, chats[1].body.session_id, "two requests shared one session")
+    assert.deepEqual(
+      chats.map((r) => r.body.message),
+      ["第一轮", "第二轮"],
+      "the host's conversation is what was sent",
+    )
+    assert.ok(!fake.requests.some((r) => r.path === "/api/chat/interrupt"), "a fresh session had nothing to interrupt")
   } finally {
     await fake.close()
   }

@@ -31,8 +31,12 @@ import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { messagesToPrompt } from "../lib/chat-bridge.mjs"
 import {
   CODAR_PORT,
+  CODAR_SESSION_PREFIX,
+  MAX_PROMPT_CHARS,
+  SERVE_TIMEOUT_MS,
   DEFAULT_CODAR_HOME,
   SCAN_MAX_DIRS_PER_ROOT,
   SCAN_MAX_ENTRIES,
@@ -43,7 +47,10 @@ import {
   openAIStream,
   resolveServeExecutable,
   serveBase,
+  serveSessionOf,
+  sessionIdFor,
   sseToOpenAI,
+  unusableRunOf,
 } from "../lib/serve.mjs"
 
 // ---- helpers ---------------------------------------------------------------
@@ -63,6 +70,15 @@ const EVENTS = [
   { completed_at: 1795208714470, data: { model: "auto", input_tokens: 19522, output_tokens: 9, total_tokens: 19531 }, event: "result", outcome: "completed", op_id: "sse_1_web-ui", provider_stop_reason: "stop", reason: "", session_id: "web-ui" },
   { completed_at: 1795208714470, data: null, event: "done", op_id: "sse_1_web-ui", session_id: "web-ui" },
 ]
+
+// EVENTS_FOR is EVENTS as the server writes them for a session the caller
+// named: the envelope's session_id is the request's own (measured 2026-11-21:
+// POST {"message":"hi","session_id":"test-sess-1"} answers 200 and every event
+// of that run carries session_id "test-sess-1"; a camelCase or shortened field
+// answers 200 with session_id "web-ui", the server's one fixed session). The
+// fake carries it faithfully, so the bridge's assertion that the server used
+// the session it was given is what the real contract is.
+const EVENTS_FOR = (sessionId) => EVENTS.map((e) => ({ ...e, session_id: sessionId }))
 const ANSWER = "你好！有什么可以帮你的吗？"
 
 // listen starts a fake serve on a free loopback port and answers with
@@ -71,6 +87,7 @@ const ANSWER = "你好！有什么可以帮你的吗？"
 // visible rather than inferred. `routes` maps "METHOD /path" to a handler
 // (req, res, call) → void; anything unrouted is a 404 in the server's own JSON
 // shape, which is what a bridge pointed at the wrong path should meet.
+//
 // deadPort is a port on this machine with nothing listening on it: a real,
 // unused port rather than a made-up one, because fetch refuses a port it calls
 // forbidden outright (9 answers "bad port" before a socket is ever opened, and
@@ -82,7 +99,15 @@ const deadPort = async () => {
   return taken
 }
 
+// listen's handlers all see the call; see sseHandler for how the session the
+// request named gets into the events (the server's own behaviour, measured).
+//
+// GET /api/chat/runs answers {"runs":[]} unless the test names its own route:
+// that is what this server answers on a machine with nothing running (measured
+// 2026-11-21), and a bridge that asks it is doing what the incident's fix
+// requires. A 404 there would be the old-server case, not the ordinary one.
 const listen = async (routes = {}, port = 0) => {
+  const all = { "GET /api/chat/runs": (req, res) => res.end(JSON.stringify({ runs: [] })), ...routes }
   const requests = []
   const server = createServer((req, res) => {
     const chunks = []
@@ -97,7 +122,7 @@ const listen = async (routes = {}, port = 0) => {
       }
       const call = { method: req.method, path: req.url, headers: req.headers, body }
       requests.push(call)
-      const handler = routes[`${req.method} ${req.url}`] ?? routes[req.url] ?? routes[req.method]
+      const handler = all[`${req.method} ${req.url}`] ?? all[req.url] ?? all[req.method]
       if (!handler) {
         res.writeHead(404, { "Content-Type": "application/json" })
         res.end(JSON.stringify({ error: "not found" }))
@@ -136,19 +161,27 @@ const settings = (model = "auto") => ({
 // sseHandler answers the chat the way the server does: event lines over the
 // connection, chunk by chunk, then close. `chunk` is how many events go out per
 // write — one is the real shape (each event arrives on its own). The caller
-// names the whole sequence, `done` included: the server sends exactly one, and
-// a fixture that added a second would be testing a conversation that cannot
+// names the whole sequence, `done` included: the server sends exactly one, and a
+// fixture that added a second would be testing a conversation that cannot
 // happen.
+//
+// The events' envelope carries the session the *request* named, by default
+// (measured: a run's events say session_id=test-sess-1 for the request that
+// named test-sess-1). A fixture that pinned "web-ui" would be the very server
+// behaviour §E calls a broken contract, and the bridge correctly refuses it — so
+// the fixture follows the body unless a test is deliberately testing the
+// mismatch.
 const sseHandler =
   (events = EVENTS, { status = 200, chunk = 1, delayMs = 0 } = {}) =>
-  async (req, res) => {
+  async (req, res, call) => {
+    const said = call?.body?.session_id ? EVENTS_FOR(call.body.session_id) : events
     res.writeHead(status, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" })
     if (chunk === 0) {
-      res.end(sseBody(events))
+      res.end(sseBody(said))
       return
     }
-    for (let i = 0; i < events.length; i += chunk) {
-      res.write(sseBody(events.slice(i, i + chunk)))
+    for (let i = 0; i < said.length; i += chunk) {
+      res.write(sseBody(said.slice(i, i + chunk)))
       if (delayMs) await new Promise((r) => setTimeout(r, delayMs))
     }
     res.end()
@@ -570,17 +603,22 @@ test("ensureServe: concurrent callers start one server between them", async () =
 // ---- C) chatStream ---------------------------------------------------------
 
 test("chatStream sends one message and yields the server's events in order", async () => {
-  // The contract is one string: `{"message": "..."}`. No system field, no
-  // messages array, no model field — the server's own settings choose the
-  // model, and anything else is refused with 400 {"error":"message is required"}.
+  // The contract is one string plus the session: `{"message": "...", "session_id":
+  // "..."}`. No system field, no messages array, no model field — the server's own
+  // settings choose the model, and a body it cannot read is 400 {"error":"message
+  // is required"}. The session is the one field §E added, and it is in every body
+  // now (the server's one fixed session is what the incident was).
   const fake = await listen({ "POST /api/chat": sseHandler() })
   try {
     const events = []
     for await (const e of chatStream({ port: fake.port, message: "hi" })) events.push(e)
-    assert.equal(fake.requests.length, 1)
-    assert.deepEqual(fake.requests[0].body, { message: "hi" }, "the body the server accepts, exactly")
-    assert.match(fake.requests[0].headers["content-type"], /application\/json/)
-    assert.match(fake.requests[0].headers.accept, /text\/event-stream/)
+    const sent = fake.requests.filter((r) => r.path === "/api/chat")
+    assert.equal(sent.length, 1, "one conversation, one request")
+    assert.deepEqual(Object.keys(sent[0].body).sort(), ["message", "session_id"], "the server's two fields, exactly")
+    assert.equal(sent[0].body.message, "hi")
+    assert.match(sent[0].body.session_id, /^mw-[a-z0-9]+$/)
+    assert.match(sent[0].headers["content-type"], /application\/json/)
+    assert.match(sent[0].headers.accept, /text\/event-stream/)
     assert.deepEqual(
       events.map((e) => e.event),
       ["run_started", "run_state", "text_delta", "text_delta", "text_delta", "context_usage", "result", "done"],
@@ -597,11 +635,13 @@ test("chatStream reads events split across reads and ignores comments and blanks
   // A stream that arrives in fixed-size chunks cuts events in half; a parser
   // that assumed one event per read would drop half an answer. The server also
   // sends `: ` comment lines on some builds (an SSE keep-alive is the usual
-  // way a Go server holds a connection), which are not events.
+  // way a Go server holds a connection), which are not events. The events here
+  // carry the session the request named, as the real server's do — a fixture
+  // with the old fixed "web-ui" would be the broken contract §E refuses.
   const fake = await listen({
-    "POST /api/chat": (req, res) => {
+    "POST /api/chat": (req, res, call) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" })
-      const body = sseBody(EVENTS.slice(2, 4))
+      const body = sseBody(EVENTS_FOR(call.body.session_id).slice(2, 4))
       for (let i = 0; i < body.length; i += 7) res.write(body.slice(i, i + 7))
       res.write(": keep-alive\n\n")
       res.end()
@@ -759,4 +799,299 @@ test("the model a chunk carries is the server's, read from its settings", async 
     await fake.close()
   }
   assert.ok(existsSync(fileURLToPath(new URL("../lib/serve.mjs", import.meta.url))), "the module under test is the one that ships")
+})
+
+// ---- E) one session per conversation ---------------------------------------
+//
+// The incident this section exists for (the person's own words: 「一会儿能用
+// 一会儿不能用」, 2026-11-21): the bridge sent no session_id at all, so every
+// conversation of every magpie request landed in the server's one fixed session
+// `web-ui`. Measured consequences on that machine:
+//
+//   - prompt_tokens: 517961 — every turn of every conversation had piled into
+//     the same session, because the server appends each request to the
+//     session's history and the bridge re-sent magpie's whole history on top;
+//   - the next request answered 200 and then, inside the stream, 「这个会话还有
+//     未完成的运行或待批准的工具调用」: the previous run (or a tool call waiting
+//     for approval) never ended, and the server refuses a second run on a busy
+//     session — HTTP 200 with the refusal in the stream, not a 502, which is
+//     why it looked intermittent rather than broken.
+//
+// What is measured about the server's session contract (2026-11-21, checked by
+// hand and not to be re-checked):
+//
+//   {"message":"hi","session_id":"test-sess-1"}  → 200, events say session_id=test-sess-1  ✅
+//   {"message":"hi","sessionId":"test-sess-2"}   → 200, events say session_id=web-ui        ❌
+//   {"message":"hi","session":"test-sess-3"}     → 200, events say session_id=web-ui        ❌
+//   GET /api/chat/runs → {"runs":[]}; POST /api/chat/interrupt exists
+//   (the binary also carries run_owner_mismatch, INVALID_SESSION_ID,
+//    RUN_CONTROL_FAILED, 无效会话参数, run id is required)
+//
+// So the field is session_id and nothing else, the server may quietly hand back
+// a different session, and the only way to know is the envelope.
+
+test("sessionIdFor produces an id the server accepts: [a-z0-9-] only, 16 to 40 characters", () => {
+  // The server's own error string for a bad one is INVALID_SESSION_ID /
+  // 无效会话参数, and a caller that could not say what it accepts wastes a run
+  // on a 400. The charset and the length are this bridge's own rule, stated
+  // here so a future change has to argue with a test.
+  const ids = Array.from({ length: 200 }, () => sessionIdFor())
+  for (const id of ids) {
+    assert.match(id, /^[a-z0-9-]+$/, `${id} is outside the server's charset`)
+    assert.ok(id.length >= 16 && id.length <= 40, `${id} is ${id.length} characters`)
+    assert.ok(id.startsWith(CODAR_SESSION_PREFIX), `${id} does not carry the bridge's prefix`)
+  }
+  assert.equal(new Set(ids).size, ids.length, "200 calls made a repeat, so the id is not unique")
+})
+
+test("chatStream sends the session id in the body, and only under session_id", async () => {
+  // The whole fix, in one assertion: the field is session_id. sessionId and
+  // session both answer 200 and both land in web-ui (measured), which is the
+  // silent failure this section is about — a wrong field name cannot be seen
+  // in the reply, only in the session that was used.
+  const fake = await listen({ "POST /api/chat": (req, res, call) => sseHandler(EVENTS_FOR(call.body.session_id))(req, res) })
+  try {
+    const events = []
+    for await (const e of chatStream({ port: fake.port, message: "hi", sessionId: "mw-0123456789ab" })) events.push(e)
+    const sent = fake.requests.find((r) => r.path === "/api/chat")
+    assert.deepEqual(sent.body, { message: "hi", session_id: "mw-0123456789ab" }, "the server's two fields, exactly")
+    assert.ok(!("sessionId" in sent.body) && !("session" in sent.body), "no camelCase alias, no shorthand")
+    assert.equal(events[0].session_id, "mw-0123456789ab", "the envelope carries the session the bridge named")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("a server that answers a different session is an error, not a silent reuse", async () => {
+  // The one thing the bridge cannot see in a 200: the server put the run
+  // somewhere else. That is what happened with every camelCase spelling — a
+  // 200 whose events said web-ui — and a bridge that believed the status would
+  // keep piling conversations into one session. The mismatch is thrown with
+  // both ids named, because the next reader has to know which side to fix.
+  //
+  // The fixture is the measured broken answer itself: EVENTS, whose envelope is
+  // pinned to web-ui regardless of the request.
+  const fake = await listen({
+    "POST /api/chat": (req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" })
+      res.end(sseBody(EVENTS))
+    },
+  })
+  try {
+    await assert.rejects(async () => {
+      for await (const _ of chatStream({ port: fake.port, message: "hi", sessionId: "mw-0123456789ab" })) break
+    }, (e) => {
+      assert.equal(e.code, "SESSION_MISMATCH")
+      assert.match(String(e.message), /mw-0123456789ab/, "the session the bridge asked for")
+      assert.match(String(e.message), /web-ui/, "the session the server used")
+      return true
+    })
+  } finally {
+    await fake.close()
+  }
+})
+
+test("two conversations with no session option are two sessions, never one", async () => {
+  // The default is a fresh session per call: the server keeps a session's
+  // history, and reusing one is how prompt_tokens reached 517961. A bridge that
+  // defaulted to reuse would pass every other test in this file and still be
+  // the bug.
+  const fake = await listen({
+    "GET /api/chat/runs": (req, res) => res.end(JSON.stringify({ runs: [] })),
+    "POST /api/chat": (req, res, call) => sseHandler(EVENTS_FOR(call.body.session_id))(req, res),
+  })
+  try {
+    for (const text of ["第一轮", "第二轮"]) for await (const _ of chatStream({ port: fake.port, message: text })) break
+    const [one, two] = fake.requests.filter((r) => r.path === "/api/chat").map((r) => r.body.session_id)
+    assert.match(one, /^mw-[a-z0-9]+$/)
+    assert.match(two, /^mw-[a-z0-9]+$/)
+    assert.notEqual(one, two, "two calls shared one session")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("session: reuse gives every call the same id, so the server keeps one history", async () => {
+  // The opposite setting, for a person who wants the model to remember the
+  // thread: `codar.session: "reuse"` names one session per bridge instance.
+  // It is opt-in because it is the mode the incident was in — the session then
+  // carries every turn, and the bridge's prompt carries them again.
+  const fake = await listen({
+    "GET /api/chat/runs": (req, res) => res.end(JSON.stringify({ runs: [] })),
+    "POST /api/chat": (req, res, call) => sseHandler(EVENTS_FOR(call.body.session_id))(req, res),
+  })
+  try {
+    const bridge = { session: "reuse" }
+    for (const text of ["第一轮", "第二轮"]) for await (const _ of chatStream({ port: fake.port, message: text, session: bridge })) break
+    const [one, two] = fake.requests.filter((r) => r.path === "/api/chat").map((r) => r.body.session_id)
+    assert.equal(one, two, "reuse was asked for and two sessions were used")
+    assert.equal(serveSessionOf(bridge), one, "and it is the session the bridge remembers")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("a session that already has a run is interrupted first, and the interrupt comes before the chat", async () => {
+  // The refusal is 「这个会话还有未完成的运行或待批准的工具调用」, and it arrives
+  // inside a 200. The other 50% of this fix is therefore to stop walking into
+  // it: ask GET /api/chat/runs, find the session's unfinished run, POST
+  // /api/chat/interrupt for it, and only then send the conversation.
+  const fake = await listen({
+    "GET /api/chat/runs": (req, res) =>
+      res.end(
+        JSON.stringify({
+          runs: [
+            { id: "run_finished", session_id: "mw-0123456789ab", status: "completed" },
+            { id: "run_busy", session_id: "mw-0123456789ab", status: "running" },
+            { id: "run_other", session_id: "web-ui", status: "running" },
+          ],
+        }),
+      ),
+    "POST /api/chat/interrupt": (req, res) => res.end(JSON.stringify({ ok: true })),
+    "POST /api/chat": (req, res, call) => sseHandler(EVENTS_FOR(call.body.session_id))(req, res),
+  })
+  try {
+    for await (const _ of chatStream({ port: fake.port, message: "hi", sessionId: "mw-0123456789ab" })) break
+    const order = fake.requests.map((r) => `${r.method} ${r.path}`)
+    assert.deepEqual(
+      order,
+      ["GET /api/chat/runs", "POST /api/chat/interrupt", "POST /api/chat"],
+      `the interrupt has to come first, and only the session's own run is touched (got ${order.join(", ")})`,
+    )
+    const interrupted = fake.requests[1].body
+    // The brief fixed the body shape as "try {session_id}, then {run_id}", and
+    // the server's own strings ("run id is required", run_owner_mismatch) say
+    // both shapes exist — so the bridge states both for the run it found, in
+    // that order, on the same run. What must never appear is another session's
+    // run.
+    assert.equal(interrupted.session_id, "mw-0123456789ab", "the session, first")
+    assert.equal(interrupted.run_id, "run_busy", "and the run that was unfinished, by its id")
+    assert.ok(!JSON.stringify(fake.requests.slice(0, 2)).includes("run_finished"), "a finished run was left alone")
+    assert.ok(!JSON.stringify(fake.requests.slice(0, 2)).includes("run_other"), "another session's run was left alone")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("an interrupt that does not take effect is answered with a new session, never a wait", async () => {
+  // The other half: interrupting can fail (RUN_CONTROL_FAILED, run_owner_mismatch,
+  // a run that will not stop), and blocking on it would hang the person's
+  // request. The bridge gives up on the session and starts a fresh one — the
+  // cost is the server's history, which is exactly what the default is anyway.
+  const BUSY = "mw-0123456789ab"
+  const sessions = []
+  const fake = await listen({
+    // The run is listed for the session the bridge is about to use, whichever
+    // one that is: this is a run that will not stop, and the server keeps
+    // reporting it. What the bridge must not do is keep using that session.
+    "GET /api/chat/runs": (req, res) => res.end(JSON.stringify({ runs: [{ id: "run_busy", session_id: sessions[0] ?? BUSY, status: "running" }] })),
+    "POST /api/chat/interrupt": (req, res) => {
+      res.writeHead(409, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ error: "RUN_CONTROL_FAILED" }))
+    },
+    "POST /api/chat": (req, res, call) => {
+      sessions.push(call.body.session_id)
+      sseHandler(EVENTS_FOR(call.body.session_id))(req, res)
+    },
+  })
+  try {
+    const started = Date.now()
+    for await (const _ of chatStream({ port: fake.port, message: "hi", sessionId: BUSY })) break
+    assert.ok(Date.now() - started < 5000, "the bridge waited on the interrupt instead of moving on")
+    assert.equal(sessions.length, 1, "one conversation was sent")
+    assert.match(sessions[0], /^mw-[a-z0-9]+$/)
+    assert.notEqual(sessions[0], BUSY, "the refused session was used anyway")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("an error event in the stream is retried once on a new session, without the user seeing it", async () => {
+  // The busy refusal reaches the bridge as an `error` event inside a 200: the
+  // conversation was not refused, the run was. Retrying once on a fresh session
+  // is what turns 「一会儿能用一会儿不能用」into an answer — and the retry has to be
+  // a new session, or it would meet the same busy one.
+  const seen = []
+  const fake = await listen({
+    "GET /api/chat/runs": (req, res) => res.end(JSON.stringify({ runs: [] })),
+    "POST /api/chat": (req, res, call) => {
+      seen.push(call.body.session_id)
+      const busy = seen.length === 1
+      sseHandler(
+        busy
+          ? [
+              { data: { code: "session_busy", message: "这个会话还有未完成的运行或待批准的工具调用" }, event: "error", session_id: call.body.session_id },
+              { data: null, event: "done", session_id: call.body.session_id },
+            ]
+          : EVENTS_FOR(call.body.session_id),
+      )(req, res)
+    },
+  })
+  try {
+    const events = []
+    for await (const e of chatStream({ port: fake.port, message: "hi", sessionId: "mw-0123456789ab" })) events.push(e)
+    const chats = fake.requests.filter((r) => r.path === "/api/chat")
+    assert.equal(chats.length, 2, "the retry did not happen")
+    assert.notEqual(seen[0], seen[1], "the retry met the same session")
+    assert.ok(!events.some((e) => e.event === "error"), "the first run's error reached the caller")
+    assert.equal(events.filter((e) => e.event === "text_delta").length, 3, "the retry's answer is what was yielded")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("a retry that fails too is said in a sentence the person can act on, with the server's own words", async () => {
+  // Two failures are not two failures to a person reading magpie: the answer
+  // says what happened and what was already tried, and keeps the server's own
+  // sentence in brackets. Silently swallowing the second one is how a bridge
+  // reports a conversation nobody had.
+  const fake = await listen({
+    "GET /api/chat/runs": (req, res) => res.end(JSON.stringify({ runs: [] })),
+    "POST /api/chat": (req, res, call) => {
+      sseHandler([
+        { data: { code: "session_busy", message: "这个会话还有未完成的运行或待批准的工具调用" }, event: "error", session_id: call.body.session_id },
+        { data: null, event: "done", session_id: call.body.session_id },
+      ])(req, res)
+    },
+  })
+  try {
+    await assert.rejects(async () => {
+      for await (const _ of chatStream({ port: fake.port, message: "hi", sessionId: "mw-0123456789ab" })) break
+    }, (e) => {
+      assert.match(String(e.message), /已自动切新会话重试/, "the person is told what was tried")
+      assert.match(String(e.message), /未完成的运行/, "the server's own words, in brackets")
+      return true
+    })
+    assert.equal(fake.requests.filter((r) => r.path === "/api/chat").length, 2, "one retry, not a loop")
+  } finally {
+    await fake.close()
+  }
+})
+
+test("a prompt past the character bound is cut in the middle and says so, so a session cannot reach half a million tokens", () => {
+  // The second half of the incident: 517961 prompt tokens. The bridge re-sends
+  // magpie's whole history every turn, and a session that also keeps its own
+  // history doubles it — so the text has a ceiling, and a text over it is cut
+  // in the middle rather than at the end (the end is the question; the start is
+  // the instructions). The marker is in the text so the model, and whoever
+  // reads the body, knows a part is missing.
+  const head = "题头".repeat(10)
+  const middle = "中间".repeat(400_000)
+  const tail = "问题是什么"
+  const got = messagesToPrompt([
+    { role: "system", content: head },
+    { role: "user", content: middle },
+    { role: "user", content: tail },
+  ])
+  assert.ok(got.length <= MAX_PROMPT_CHARS + 200, `the prompt is ${got.length} characters; the bound is ${MAX_PROMPT_CHARS}`)
+  assert.ok(got.startsWith(head), "the opening survived — it is the instructions")
+  assert.ok(got.endsWith(tail), "the last user turn survived — it is the question")
+  assert.match(got, /……（中间已截断）……/, "the cut is marked where it happened")
+  assert.ok(got.indexOf("中间") < got.indexOf("……（中间已截断）……"), "the cut is in the middle, not at either end")
+
+  // and a prompt that fits is passed through untouched, byte for byte: the
+  // bridge must not rewrite a conversation it can send whole.
+  const short = [{ role: "system", content: "你是科搭。" }, { role: "user", content: "你好" }]
+  assert.equal(messagesToPrompt(short, { maxChars: MAX_PROMPT_CHARS }), "你是科搭。\n\n你好")
+  assert.ok(SERVE_TIMEOUT_MS > 0 && unusableRunOf({ status: "running" }), "the module under test is the one that ships")
 })
